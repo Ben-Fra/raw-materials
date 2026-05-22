@@ -190,6 +190,48 @@ st.set_page_config(
     layout="wide",
 )
 
+
+def inject_pwa():
+    st.html("""
+    <script>
+    (() => {
+        const doc = window.parent.document;
+        const head = doc.head || doc.getElementsByTagName("head")[0];
+        const base = "/app/static";
+
+        function ensureLink(rel, href) {
+            if (!doc.querySelector(`link[rel="${rel}"]`)) {
+                const l = doc.createElement("link");
+                l.rel = href.endsWith(".json") ? rel : rel;
+                l.rel = rel; l.href = href;
+                head.appendChild(l);
+            }
+        }
+        function ensureMeta(name, content) {
+            if (!doc.querySelector(`meta[name="${name}"]`)) {
+                const m = doc.createElement("meta");
+                m.name = name; m.content = content;
+                head.appendChild(m);
+            }
+        }
+
+        ensureLink("manifest", `${base}/manifest.json`);
+        ensureLink("apple-touch-icon", `${base}/icon-192.png`);
+        ensureMeta("theme-color", "#1565C0");
+        ensureMeta("mobile-web-app-capable", "yes");
+        ensureMeta("apple-mobile-web-app-capable", "yes");
+        ensureMeta("apple-mobile-web-app-title", "Склад сырья");
+        ensureMeta("apple-mobile-web-app-status-bar-style", "black-translucent");
+
+        if ("serviceWorker" in window.parent.navigator) {
+            window.parent.navigator.serviceWorker
+                .register(`${base}/service-worker.js`, { scope: `${base}/` })
+                .catch(() => {});
+        }
+    })();
+    </script>
+    """)
+
 # ─── UI HELPERS ───────────────────────────────────────────────────────────────
 
 def inject_css():
@@ -890,6 +932,7 @@ def page_packaging():
 
 def main():
     init_db()
+    inject_pwa()
     inject_css()
     auth_script()
 
