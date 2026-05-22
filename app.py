@@ -1,0 +1,927 @@
+from pathlib import Path
+import base64, hashlib, hmac, json, os, time, sqlite3
+from datetime import date, timedelta
+from zoneinfo import ZoneInfo
+
+import pandas as pd
+import streamlit as st
+
+# ─── CONFIG ───────────────────────────────────────────────────────────────────
+
+BASE_DIR     = Path(__file__).parent
+DATABASE_URL = os.environ.get("DATABASE_URL", "")
+APP_TZ       = ZoneInfo("Asia/Jerusalem")
+AUTH_DAYS    = 30
+STATIC_BASE  = "/app/static"
+
+RAW_MATERIALS = sorted(set([
+    "דג דניס", "הרינג 350+", "ורדון", "ורדון ללא ראש", "טונה חומה",
+    "לש 0.8+", "לש 1.2+", "לש 1.5+", "לשונון", "מקרל 500+",
+    "מקרל 600+", "מקרל 600+ G", "סלקה 12-15", "סלקה 16+",
+    "פילה הרינג", "פילה הרינג 4-7", "פילה הרינג 60-100",
+    "פילה סלמון", "פילה סלמון נורבגי", "פילה סלמון טרי",
+    "פילה סלמון קפוא", "פורל ים ללא ראש", "קפלין 23-25",
+]))
+
+SUPPLIERS = ["גו פיש", "לנדוי", "צ'ירינה"]
+
+PACKAGING_UNITS = ["кг", "шт", "л", "рулон", "коробка", "мешок", "м"]
+
+# ─── AUTH ─────────────────────────────────────────────────────────────────────
+
+def load_users():
+    env = os.environ.get("APP_USERS_JSON")
+    if env:
+        return json.loads(env)
+    try:
+        s = st.secrets.get("users", {})
+        if s:
+            return dict(s)
+    except Exception:
+        pass
+    return {"Alexander": "", "Oleg": "", "Admin": ""}
+
+
+USERS = load_users()
+_SECRET = (
+    os.environ.get("APP_AUTH_SECRET")
+    or os.environ.get("APP_USERS_JSON")
+    or json.dumps(USERS, sort_keys=True)
+)
+
+
+def _b64enc(payload):
+    return base64.urlsafe_b64encode(
+        json.dumps(payload, separators=(",", ":"), sort_keys=True).encode()
+    ).decode().rstrip("=")
+
+
+def _b64dec(text):
+    pad = "=" * (-len(text) % 4)
+    return json.loads(base64.urlsafe_b64decode((text + pad).encode()))
+
+
+def _sign(text):
+    return hmac.new(_SECRET.encode(), text.encode(), hashlib.sha256).hexdigest()
+
+
+def make_token(username):
+    p = _b64enc({"username": username, "expires_at": int(time.time()) + AUTH_DAYS * 86400})
+    return f"{p}.{_sign(p)}"
+
+
+def check_token(token):
+    if not token or "." not in token:
+        return None
+    text, sig = token.rsplit(".", 1)
+    if not hmac.compare_digest(sig, _sign(text)):
+        return None
+    try:
+        p = _b64dec(text)
+    except Exception:
+        return None
+    u = p.get("username")
+    if u not in USERS or p.get("expires_at", 0) < int(time.time()):
+        return None
+    return u
+
+# ─── DATABASE ─────────────────────────────────────────────────────────────────
+
+def _conn():
+    if DATABASE_URL:
+        import psycopg2
+        return psycopg2.connect(DATABASE_URL), True
+    c = sqlite3.connect(str(BASE_DIR / "raw_materials.db"), check_same_thread=False)
+    c.row_factory = sqlite3.Row
+    return c, False
+
+
+def db_query(sql, params=()):
+    conn, is_pg = _conn()
+    if is_pg:
+        sql = sql.replace("?", "%s")
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        if cur.description is None:
+            return []
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+    finally:
+        conn.close()
+
+
+def db_run(sql, params=()):
+    conn, is_pg = _conn()
+    if is_pg:
+        sql = sql.replace("?", "%s")
+    try:
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def init_db():
+    conn, is_pg = _conn()
+    pk  = "SERIAL PRIMARY KEY" if is_pg else "INTEGER PRIMARY KEY AUTOINCREMENT"
+    now = "NOW()" if is_pg else "datetime('now')"
+    stmts = [
+        f"""CREATE TABLE IF NOT EXISTS raw_receipts (
+            id {pk},
+            receipt_date TEXT NOT NULL,
+            order_number TEXT NOT NULL,
+            supplier TEXT NOT NULL,
+            material TEXT NOT NULL,
+            quantity_kg REAL NOT NULL,
+            price_per_kg REAL,
+            total_price REAL,
+            production_date TEXT,
+            expiry_date TEXT,
+            created_at TEXT DEFAULT ({now}),
+            created_by TEXT NOT NULL DEFAULT 'unknown'
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS production_writeoffs (
+            id {pk},
+            receipt_id INTEGER NOT NULL,
+            material TEXT NOT NULL,
+            supplier TEXT NOT NULL,
+            quantity_kg REAL NOT NULL,
+            writeoff_date TEXT NOT NULL,
+            batch_number TEXT,
+            notes TEXT,
+            created_at TEXT DEFAULT ({now}),
+            created_by TEXT NOT NULL DEFAULT 'unknown'
+        )""",
+        f"""CREATE TABLE IF NOT EXISTS packaging_receipts (
+            id {pk},
+            receipt_date TEXT NOT NULL,
+            item_name TEXT NOT NULL,
+            quantity REAL NOT NULL,
+            unit TEXT NOT NULL,
+            price_per_unit REAL,
+            total_price REAL,
+            supplier TEXT,
+            notes TEXT,
+            created_at TEXT DEFAULT ({now}),
+            created_by TEXT NOT NULL DEFAULT 'unknown'
+        )""",
+    ]
+    try:
+        cur = conn.cursor()
+        for s in stmts:
+            cur.execute(s)
+        conn.commit()
+        # Migration: add batch_number if column doesn't exist yet
+        try:
+            cur.execute("ALTER TABLE production_writeoffs ADD COLUMN batch_number TEXT")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
+    finally:
+        conn.close()
+
+# ─── PAGE CONFIG (must be first st call) ──────────────────────────────────────
+
+st.set_page_config(
+    page_title="Склад сырья",
+    page_icon="🏭",
+    layout="wide",
+)
+
+# ─── UI HELPERS ───────────────────────────────────────────────────────────────
+
+def inject_css():
+    st.markdown("""
+    <style>
+    #MainMenu, header, footer {visibility: hidden;}
+    .block-container {padding: 1rem 1.5rem; max-width: 1200px;}
+
+    .stButton > button {
+        min-height: 3rem; font-size: 1.05rem; width: 100%;
+        border-radius: 8px; font-weight: 600;
+    }
+    .page-title {
+        font-size: 1.7rem; font-weight: 700; color: #1565C0;
+        margin-bottom: 1.2rem; border-bottom: 2px solid #1565C0;
+        padding-bottom: 0.4rem;
+    }
+    .metric-card {
+        background: #E3F2FD; border-radius: 10px;
+        padding: 0.9rem; text-align: center; margin: 0.4rem 0;
+    }
+    .metric-card h2 {font-size: 1.8rem; margin: 0; color: #1565C0;}
+    .metric-card p  {font-size: 0.85rem; margin: 0; color: #555;}
+    </style>
+    """, unsafe_allow_html=True)
+
+
+def auth_script():
+    st.html("""
+    <script>
+    (() => {
+        const KEY = "raw_materials_auth_token";
+        const pw  = window.parent;
+        const url = new URL(pw.location.href);
+        const tok = url.searchParams.get("auth");
+        if (tok) {
+            pw.localStorage.setItem(KEY, tok);
+            url.searchParams.delete("auth");
+            pw.history.replaceState(null, "", url.toString());
+            return;
+        }
+        const saved = pw.localStorage.getItem(KEY);
+        if (saved && !url.searchParams.has("auth")) {
+            url.searchParams.set("auth", saved);
+            pw.location.replace(url.toString());
+        }
+    })();
+    </script>
+    """)
+
+
+def clear_auth_script():
+    st.html("""
+    <script>
+    (() => {
+        const KEY = "raw_materials_auth_token";
+        window.parent.localStorage.removeItem(KEY);
+        const url = new URL(window.parent.location.href);
+        url.searchParams.delete("auth");
+        window.parent.history.replaceState(null, "", url.toString());
+    })();
+    </script>
+    """)
+
+
+def back_btn(dest="home", label="← Назад"):
+    if st.button(label, key=f"back_{dest}"):
+        st.session_state.page = dest
+        st.rerun()
+
+# ─── LOGIN ────────────────────────────────────────────────────────────────────
+
+def page_login():
+    st.markdown('<div class="page-title">🏭 Управление сырьём</div>', unsafe_allow_html=True)
+    st.markdown("### Вход в систему")
+    _, col, _ = st.columns([1, 2, 1])
+    with col:
+        username = st.selectbox("Пользователь", [""] + list(USERS.keys()))
+        password = st.text_input("Пароль", type="password")
+        if st.button("Войти", type="primary"):
+            if username and USERS.get(username) == password:
+                token = make_token(username)
+                st.query_params["auth"] = token
+                st.session_state.current_user = username
+                st.rerun()
+            else:
+                st.error("Неверный логин или пароль")
+
+# ─── HOME ─────────────────────────────────────────────────────────────────────
+
+def page_home():
+    user = st.session_state.current_user
+    st.markdown('<div class="page-title">🏭 Управление сырьём</div>', unsafe_allow_html=True)
+    st.markdown(f"Добро пожаловать, **{user}**")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.markdown("#### 📦 Склад №2 — Сырьё")
+        if st.button("📥 Приём сырья", key="nav_recv"):
+            st.session_state.page = "receive"; st.rerun()
+        if st.button("📊 Остатки на складе", key="nav_stock"):
+            st.session_state.page = "stock"; st.rerun()
+        if st.button("🏭 Списать в производство", key="nav_wo"):
+            st.session_state.page = "writeoff"; st.rerun()
+    with col2:
+        st.markdown("#### 🔄 Производство и упаковка")
+        if st.button("🔄 Сырьё в производстве (склад №3)", key="nav_prod"):
+            st.session_state.page = "production"; st.rerun()
+        if st.button("📦 Упаковка и материалы (склад №5)", key="nav_pack"):
+            st.session_state.page = "packaging"; st.rerun()
+
+    st.divider()
+
+    raw_kg  = (db_query("SELECT COALESCE(SUM(quantity_kg),0) AS v FROM raw_receipts") or [{"v": 0}])[0]["v"]
+    wo_kg   = (db_query("SELECT COALESCE(SUM(quantity_kg),0) AS v FROM production_writeoffs") or [{"v": 0}])[0]["v"]
+    pack_n  = (db_query("SELECT COUNT(*) AS v FROM packaging_receipts") or [{"v": 0}])[0]["v"]
+    remain  = raw_kg - wo_kg
+
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(f'<div class="metric-card"><h2>{remain:,.0f} кг</h2><p>Остаток сырья (склад №2)</p></div>', unsafe_allow_html=True)
+    c2.markdown(f'<div class="metric-card"><h2>{wo_kg:,.0f} кг</h2><p>Отправлено в производство</p></div>', unsafe_allow_html=True)
+    c3.markdown(f'<div class="metric-card"><h2>{pack_n}</h2><p>Записей упаковки (склад №5)</p></div>', unsafe_allow_html=True)
+
+    st.divider()
+    if st.button("Выйти", key="logout"):
+        clear_auth_script()
+        del st.session_state.current_user
+        st.query_params.clear()
+        st.rerun()
+
+# ─── RECEIVE ──────────────────────────────────────────────────────────────────
+
+def page_receive():
+    st.markdown('<div class="page-title">📥 Приём сырья — Склад №2</div>', unsafe_allow_html=True)
+    back_btn()
+
+    user  = st.session_state.current_user
+    MANUAL = "✏️ Ввести вручную..."
+
+    if "recv_buffer" not in st.session_state:
+        st.session_state.recv_buffer = []
+    buf = st.session_state.recv_buffer
+
+    # ── Форма добавления в буфер ──
+    st.markdown("#### Добавить позицию в буфер")
+    with st.form("recv_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            recv_date       = st.date_input("Дата получения", value=date.today())
+            order_no        = st.text_input("Номер заказа")
+            supplier_sel    = st.selectbox("Поставщик (ספק)", [""] + SUPPLIERS + [MANUAL])
+            supplier_manual = st.text_input("Поставщик — вручную", placeholder="Введите название") if supplier_sel == MANUAL else ""
+            material_sel    = st.selectbox("Товар (סחורה)", [""] + RAW_MATERIALS + [MANUAL])
+            material_manual = st.text_input("Товар — вручную", placeholder="Введите название") if material_sel == MANUAL else ""
+        with col2:
+            qty_kg    = st.number_input("Количество кг", min_value=0.0, step=0.001, format="%.3f")
+            price_kg  = st.number_input("Цена за кг", min_value=0.0, step=0.01, format="%.3f")
+            prod_date = st.date_input("Дата производства (תוצרת)", value=None)
+            exp_date  = st.date_input("Годен до (תוקף)", value=None)
+
+        supplier = supplier_manual.strip() if supplier_sel == MANUAL else supplier_sel
+        material = material_manual.strip() if material_sel == MANUAL else material_sel
+        total    = round(qty_kg * price_kg, 3) if qty_kg and price_kg else 0.0
+        st.markdown(f"**Общая сумма: {total:,.3f}**")
+
+        if st.form_submit_button("➕ Добавить в буфер", type="primary", use_container_width=True):
+            errors = []
+            if not order_no.strip(): errors.append("Укажите номер заказа")
+            if not supplier:         errors.append("Выберите или введите поставщика")
+            if not material:         errors.append("Выберите или введите название товара")
+            if qty_kg <= 0:          errors.append("Количество должно быть больше 0")
+            if errors:
+                for e in errors: st.error(e)
+            else:
+                buf.append({
+                    "recv_date": recv_date.isoformat(),
+                    "order_no":  order_no.strip(),
+                    "supplier":  supplier,
+                    "material":  material,
+                    "qty_kg":    qty_kg,
+                    "price_kg":  price_kg or None,
+                    "total":     total or None,
+                    "prod_date": prod_date.isoformat() if prod_date else None,
+                    "exp_date":  exp_date.isoformat()  if exp_date  else None,
+                })
+                st.success(f"Добавлено в буфер: {material} — {qty_kg:,.3f} кг")
+
+    # ── Буфер ──
+    st.divider()
+    st.markdown(f"#### Буфер — {len(buf)} поз. (проверьте перед сохранением на склад)")
+
+    if not buf:
+        st.info("Буфер пуст. Добавьте позиции выше, проверьте и сохраните на склад.")
+    else:
+        df_buf = pd.DataFrame([{
+            "№": i + 1,
+            "Дата": r["recv_date"], "Заказ": r["order_no"],
+            "Поставщик": r["supplier"], "Товар": r["material"],
+            "Кг": r["qty_kg"], "Цена/кг": r["price_kg"] or "",
+            "Сумма": r["total"] or "",
+            "Произв.": r["prod_date"] or "", "Годен до": r["exp_date"] or "",
+        } for i, r in enumerate(buf)])
+        st.dataframe(df_buf, use_container_width=True, hide_index=True)
+
+        idx = st.selectbox(
+            "Выберите позицию для редактирования / удаления",
+            range(len(buf)),
+            format_func=lambda i: f"#{i+1}  {buf[i]['material']} | {buf[i]['supplier']} | {buf[i]['qty_kg']:,.3f} кг",
+            key="recv_edit_idx",
+        )
+        item = buf[idx]
+
+        with st.form(f"edit_recv_{idx}"):
+            st.markdown(f"**Редактирование позиции #{idx + 1}**")
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                e_date     = st.date_input("Дата",          value=date.fromisoformat(item["recv_date"]))
+                e_order    = st.text_input("Номер заказа",   value=item["order_no"])
+                e_supplier = st.text_input("Поставщик",      value=item["supplier"])
+                e_material = st.text_input("Товар",          value=item["material"])
+            with ec2:
+                e_qty   = st.number_input("Кг",       value=float(item["qty_kg"]),         min_value=0.001, step=0.001, format="%.3f")
+                e_price = st.number_input("Цена/кг",  value=float(item["price_kg"] or 0),  min_value=0.0,   step=0.01,  format="%.3f")
+                e_prod  = st.date_input("Дата произв.", value=date.fromisoformat(item["prod_date"]) if item["prod_date"] else None)
+                e_exp   = st.date_input("Годен до",    value=date.fromisoformat(item["exp_date"])  if item["exp_date"]  else None)
+
+            if st.form_submit_button("💾 Сохранить изменения", use_container_width=True):
+                buf[idx] = {
+                    "recv_date": e_date.isoformat(),
+                    "order_no":  e_order.strip(),
+                    "supplier":  e_supplier.strip(),
+                    "material":  e_material.strip(),
+                    "qty_kg":    e_qty,
+                    "price_kg":  e_price or None,
+                    "total":     round(e_qty * e_price, 3) if e_price else None,
+                    "prod_date": e_prod.isoformat() if e_prod else None,
+                    "exp_date":  e_exp.isoformat()  if e_exp  else None,
+                }
+                st.success("Позиция обновлена")
+                st.rerun()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button(f"🗑 Удалить позицию #{idx + 1}", use_container_width=True):
+                buf.pop(idx)
+                st.rerun()
+        with c2:
+            if st.button("🗑 Очистить весь буфер", use_container_width=True):
+                buf.clear()
+                st.rerun()
+        with c3:
+            if st.button(f"✅ Сохранить на склад ({len(buf)} поз.)", type="primary", use_container_width=True):
+                for r in buf:
+                    db_run(
+                        """INSERT INTO raw_receipts
+                            (receipt_date, order_number, supplier, material,
+                             quantity_kg, price_per_kg, total_price,
+                             production_date, expiry_date, created_by)
+                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+                        (r["recv_date"], r["order_no"], r["supplier"], r["material"],
+                         r["qty_kg"], r["price_kg"], r["total"],
+                         r["prod_date"], r["exp_date"], user),
+                    )
+                n = len(buf)
+                buf.clear()
+                st.success(f"✅ Сохранено на склад: {n} позиций")
+                st.rerun()
+
+    st.divider()
+    st.markdown("#### Последние поступления на складе")
+    rows = db_query(
+        "SELECT receipt_date,order_number,supplier,material,"
+        "quantity_kg,price_per_kg,total_price,expiry_date "
+        "FROM raw_receipts ORDER BY id DESC LIMIT 20"
+    )
+    if rows:
+        df = pd.DataFrame(rows)
+        df.columns = ["Дата", "№ заказа", "Поставщик", "Товар", "Кг", "Цена/кг", "Сумма", "Годен до"]
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Нет поступлений")
+
+# ─── STOCK ────────────────────────────────────────────────────────────────────
+
+def page_stock():
+    st.markdown('<div class="page-title">📊 Остатки сырья — Склад №2</div>', unsafe_allow_html=True)
+    back_btn()
+
+    rows = db_query("""
+        SELECT
+            rr.id,
+            rr.receipt_date,
+            rr.order_number,
+            rr.supplier,
+            rr.material,
+            rr.quantity_kg,
+            rr.price_per_kg,
+            rr.production_date,
+            rr.expiry_date,
+            COALESCE(SUM(pw.quantity_kg), 0) AS written_off,
+            rr.quantity_kg - COALESCE(SUM(pw.quantity_kg), 0) AS remaining_kg
+        FROM raw_receipts rr
+        LEFT JOIN production_writeoffs pw ON pw.receipt_id = rr.id
+        GROUP BY rr.id
+        HAVING rr.quantity_kg - COALESCE(SUM(pw.quantity_kg), 0) > 0.001
+        ORDER BY
+            CASE WHEN rr.expiry_date IS NULL THEN 1 ELSE 0 END,
+            rr.expiry_date ASC
+    """)
+
+    if not rows:
+        st.info("Склад пуст")
+        return
+
+    df = pd.DataFrame(rows)
+    total_remain = df["remaining_kg"].sum()
+    total_value  = (df["remaining_kg"] * df["price_per_kg"].fillna(0)).sum()
+
+    c1, c2 = st.columns(2)
+    c1.markdown(f'<div class="metric-card"><h2>{total_remain:,.0f} кг</h2><p>Общий остаток</p></div>', unsafe_allow_html=True)
+    c2.markdown(f'<div class="metric-card"><h2>{total_value:,.0f}</h2><p>Стоимость остатка</p></div>', unsafe_allow_html=True)
+
+    today = date.today().isoformat()
+    soon  = (date.today() + timedelta(days=30)).isoformat()
+
+    display = df[[
+        "receipt_date", "order_number", "supplier", "material",
+        "quantity_kg", "written_off", "remaining_kg",
+        "price_per_kg", "production_date", "expiry_date",
+    ]].copy()
+    display.columns = [
+        "Дата прихода", "№ заказа", "Поставщик", "Товар",
+        "Принято кг", "Списано кг", "Остаток кг",
+        "Цена/кг", "Дата произв.", "Годен до",
+    ]
+
+    def highlight(row):
+        exp = row["Годен до"]
+        if exp and str(exp) < today:
+            return ["background-color:#FFEBEE"] * len(row)
+        if exp and str(exp) < soon:
+            return ["background-color:#FFF9C4"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(display.style.apply(highlight, axis=1), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### По видам сырья")
+    summary = (
+        df.groupby("material")["remaining_kg"]
+        .sum()
+        .reset_index()
+        .sort_values("remaining_kg", ascending=False)
+    )
+    summary.columns = ["Товар", "Остаток кг"]
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    if st.button("📥 Скачать Excel", key="dl_stock"):
+        from io import BytesIO
+        buf = BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+            display.to_excel(w, index=False, sheet_name="Остатки")
+            summary.to_excel(w, index=False, sheet_name="По товарам")
+        st.download_button("⬇ Скачать файл", buf.getvalue(), "остатки_сырья.xlsx")
+
+# ─── WRITE-OFF ────────────────────────────────────────────────────────────────
+
+def page_writeoff():
+    st.markdown('<div class="page-title">🏭 Списание в производство — Склад №2 → №3</div>', unsafe_allow_html=True)
+    back_btn()
+
+    user = st.session_state.current_user
+
+    if "wo_buffer" not in st.session_state:
+        st.session_state.wo_buffer = []
+    buf = st.session_state.wo_buffer
+
+    # Загружаем остатки из БД
+    stock = db_query("""
+        SELECT
+            rr.id, rr.material, rr.supplier, rr.order_number,
+            rr.expiry_date, rr.receipt_date,
+            rr.quantity_kg - COALESCE(SUM(pw.quantity_kg), 0) AS remaining_kg
+        FROM raw_receipts rr
+        LEFT JOIN production_writeoffs pw ON pw.receipt_id = rr.id
+        GROUP BY rr.id
+        HAVING rr.quantity_kg - COALESCE(SUM(pw.quantity_kg), 0) > 0.001
+        ORDER BY
+            CASE WHEN rr.expiry_date IS NULL THEN 1 ELSE 0 END,
+            rr.expiry_date ASC
+    """)
+
+    if not stock:
+        st.info("Склад пуст — нет сырья для списания")
+        return
+
+    # Считаем, сколько уже добавлено в буфер по каждому receipt_id
+    buffered = {}
+    for b in buf:
+        buffered[b["receipt_id"]] = buffered.get(b["receipt_id"], 0) + b["qty_kg"]
+
+    # Доступный остаток = остаток в БД − уже в буфере
+    available = {r["id"]: r["remaining_kg"] - buffered.get(r["id"], 0) for r in stock}
+    stock_avail = [r for r in stock if available[r["id"]] > 0.001]
+
+    # ── Форма добавления в буфер ──
+    st.markdown("#### Добавить позицию в буфер")
+    if not stock_avail:
+        st.warning("Всё доступное сырьё уже добавлено в буфер.")
+    else:
+        options = [
+            f"{r['material']} | {r['supplier']} | доступно: {available[r['id']]:,.3f} кг"
+            f" | до: {r['expiry_date'] or '—'} | #{r['id']}"
+            for r in stock_avail
+        ]
+        with st.form("wo_form", clear_on_submit=True):
+            selected = st.selectbox("Выберите позицию со склада №2", options)
+            wo_qty   = st.number_input("Количество для списания (кг)", min_value=0.001, step=0.001, format="%.3f")
+            wo_date  = st.date_input("Дата списания", value=date.today())
+            notes    = st.text_input("Примечание (необязательно)")
+
+            if st.form_submit_button("➕ Добавить в буфер", type="primary", use_container_width=True):
+                rid = int(selected.rsplit("#", 1)[1])
+                row = next(r for r in stock if r["id"] == rid)
+                avail = available[rid]
+                if wo_qty > avail + 0.001:
+                    st.error(f"Нельзя добавить {wo_qty:,.3f} кг — доступно только {avail:,.3f} кг")
+                else:
+                    batch = f"{row['material']} {wo_date.strftime('%d/%m/%y')}"
+                    buf.append({
+                        "receipt_id":   rid,
+                        "material":     row["material"],
+                        "supplier":     row["supplier"],
+                        "qty_kg":       wo_qty,
+                        "wo_date":      wo_date.isoformat(),
+                        "batch_number": batch,
+                        "notes":        notes.strip() or None,
+                    })
+                    st.success(f"Добавлено в буфер: {row['material']} — {wo_qty:,.3f} кг | Партия: {batch}")
+
+    # ── Буфер ──
+    st.divider()
+    st.markdown(f"#### Буфер — {len(buf)} поз. (проверьте перед списанием)")
+
+    if not buf:
+        st.info("Буфер пуст. Добавьте позиции выше, проверьте и подтвердите списание.")
+    else:
+        df_buf = pd.DataFrame([{
+            "№": i + 1, "Партия": b["batch_number"], "Дата": b["wo_date"],
+            "Товар": b["material"], "Поставщик": b["supplier"],
+            "Кг": b["qty_kg"], "Примечание": b["notes"] or "",
+        } for i, b in enumerate(buf)])
+        st.dataframe(df_buf, use_container_width=True, hide_index=True)
+
+        idx = st.selectbox(
+            "Выберите позицию для редактирования / удаления",
+            range(len(buf)),
+            format_func=lambda i: f"#{i+1}  {buf[i]['batch_number']} | {buf[i]['qty_kg']:,.3f} кг",
+            key="wo_edit_idx",
+        )
+        item = buf[idx]
+        # Максимум для редактирования = остаток в БД − буфер без этой позиции
+        rid_item = item["receipt_id"]
+        other_buffered = sum(b["qty_kg"] for j, b in enumerate(buf) if j != idx and b["receipt_id"] == rid_item)
+        db_remaining = next((r["remaining_kg"] for r in stock if r["id"] == rid_item), 0)
+        max_qty = db_remaining - other_buffered
+
+        with st.form(f"edit_wo_{idx}"):
+            st.markdown(f"**Редактирование #{idx + 1} — партия: {item['batch_number']}**")
+            e_qty   = st.number_input("Кг", value=float(item["qty_kg"]), min_value=0.001, max_value=float(max_qty), step=0.001, format="%.3f")
+            e_date  = st.date_input("Дата списания", value=date.fromisoformat(item["wo_date"]))
+            e_notes = st.text_input("Примечание", value=item["notes"] or "")
+
+            if st.form_submit_button("💾 Сохранить изменения", use_container_width=True):
+                new_date = e_date.isoformat()
+                buf[idx]["qty_kg"]       = e_qty
+                buf[idx]["wo_date"]      = new_date
+                buf[idx]["notes"]        = e_notes.strip() or None
+                buf[idx]["batch_number"] = f"{item['material']} {e_date.strftime('%d/%m/%y')}"
+                st.success("Позиция обновлена")
+                st.rerun()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button(f"🗑 Удалить позицию #{idx + 1}", use_container_width=True):
+                buf.pop(idx)
+                st.rerun()
+        with c2:
+            if st.button("🗑 Очистить весь буфер", use_container_width=True):
+                buf.clear()
+                st.rerun()
+        with c3:
+            if st.button(f"✅ Списать в производство ({len(buf)} поз.)", type="primary", use_container_width=True):
+                for b in buf:
+                    db_run(
+                        """INSERT INTO production_writeoffs
+                            (receipt_id, material, supplier, quantity_kg,
+                             writeoff_date, batch_number, notes, created_by)
+                           VALUES (?,?,?,?,?,?,?,?)""",
+                        (b["receipt_id"], b["material"], b["supplier"],
+                         b["qty_kg"], b["wo_date"], b["batch_number"], b["notes"], user),
+                    )
+                n = len(buf)
+                buf.clear()
+                st.success(f"✅ Списано в производство: {n} позиций")
+                st.rerun()
+
+    st.divider()
+    st.markdown("#### История списаний")
+    hist = db_query(
+        "SELECT batch_number,writeoff_date,material,supplier,quantity_kg,notes,created_by "
+        "FROM production_writeoffs ORDER BY id DESC LIMIT 30"
+    )
+    if hist:
+        df = pd.DataFrame(hist)
+        df.columns = ["Партия", "Дата", "Товар", "Поставщик", "Кг", "Примечание", "Оператор"]
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Нет списаний")
+
+# ─── PRODUCTION ───────────────────────────────────────────────────────────────
+
+def page_production():
+    st.markdown('<div class="page-title">🔄 Сырьё в производстве — Склад №3</div>', unsafe_allow_html=True)
+    back_btn()
+
+    rows = db_query("""
+        SELECT
+            pw.batch_number,
+            pw.writeoff_date,
+            pw.material,
+            pw.supplier,
+            pw.quantity_kg,
+            pw.notes,
+            rr.order_number,
+            rr.expiry_date
+        FROM production_writeoffs pw
+        JOIN raw_receipts rr ON rr.id = pw.receipt_id
+        ORDER BY pw.writeoff_date DESC, pw.id DESC
+    """)
+
+    if not rows:
+        st.info("Нет данных о списаниях в производство")
+        return
+
+    df = pd.DataFrame(rows)
+    total_kg = df["quantity_kg"].sum()
+    st.markdown(
+        f'<div class="metric-card"><h2>{total_kg:,.0f} кг</h2>'
+        f'<p>Всего отправлено в производство</p></div>',
+        unsafe_allow_html=True,
+    )
+
+    df.columns = ["Партия", "Дата списания", "Товар", "Поставщик", "Кг", "Примечание", "№ заказа", "Годен до"]
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("#### По видам сырья (всего)")
+    summary = df.groupby("Товар")["Кг"].sum().reset_index().sort_values("Кг", ascending=False)
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+# ─── PACKAGING ────────────────────────────────────────────────────────────────
+
+def page_packaging():
+    st.markdown('<div class="page-title">📦 Упаковка и материалы — Склад №5</div>', unsafe_allow_html=True)
+    back_btn()
+
+    user = st.session_state.current_user
+
+    if "pack_buffer" not in st.session_state:
+        st.session_state.pack_buffer = []
+    buf = st.session_state.pack_buffer
+
+    # ── Форма добавления в буфер ──
+    st.markdown("#### Добавить позицию в буфер")
+    with st.form("pack_form", clear_on_submit=True):
+        col1, col2 = st.columns(2)
+        with col1:
+            recv_date  = st.date_input("Дата получения", value=date.today())
+            item_name  = st.text_input("Наименование")
+            qty        = st.number_input("Количество", min_value=0.0, step=0.01, format="%.3f")
+            unit       = st.selectbox("Единица измерения", PACKAGING_UNITS)
+        with col2:
+            price_unit = st.number_input("Цена за единицу", min_value=0.0, step=0.01, format="%.3f")
+            supplier   = st.text_input("Поставщик")
+            notes      = st.text_input("Примечание")
+
+        total = round(qty * price_unit, 3) if qty and price_unit else 0.0
+        st.markdown(f"**Общая сумма: {total:,.3f}**")
+
+        if st.form_submit_button("➕ Добавить в буфер", type="primary", use_container_width=True):
+            if not item_name.strip():
+                st.error("Укажите наименование")
+            elif qty <= 0:
+                st.error("Количество должно быть больше 0")
+            else:
+                buf.append({
+                    "recv_date":  recv_date.isoformat(),
+                    "item_name":  item_name.strip(),
+                    "qty":        qty,
+                    "unit":       unit,
+                    "price_unit": price_unit or None,
+                    "total":      total or None,
+                    "supplier":   supplier.strip() or None,
+                    "notes":      notes.strip() or None,
+                })
+                st.success(f"Добавлено в буфер: {item_name} — {qty:,.3f} {unit}")
+
+    # ── Буфер ──
+    st.divider()
+    st.markdown(f"#### Буфер — {len(buf)} поз. (проверьте перед сохранением на склад)")
+
+    if not buf:
+        st.info("Буфер пуст. Добавьте позиции выше, проверьте и сохраните на склад.")
+    else:
+        df_buf = pd.DataFrame([{
+            "№": i + 1, "Дата": r["recv_date"], "Наименование": r["item_name"],
+            "Кол-во": r["qty"], "Ед.": r["unit"],
+            "Цена/ед.": r["price_unit"] or "", "Сумма": r["total"] or "",
+            "Поставщик": r["supplier"] or "", "Примечание": r["notes"] or "",
+        } for i, r in enumerate(buf)])
+        st.dataframe(df_buf, use_container_width=True, hide_index=True)
+
+        idx = st.selectbox(
+            "Выберите позицию для редактирования / удаления",
+            range(len(buf)),
+            format_func=lambda i: f"#{i+1}  {buf[i]['item_name']} | {buf[i]['qty']:,.3f} {buf[i]['unit']}",
+            key="pack_edit_idx",
+        )
+        item = buf[idx]
+
+        with st.form(f"edit_pack_{idx}"):
+            st.markdown(f"**Редактирование позиции #{idx + 1}**")
+            ec1, ec2 = st.columns(2)
+            with ec1:
+                e_date  = st.date_input("Дата",         value=date.fromisoformat(item["recv_date"]))
+                e_name  = st.text_input("Наименование", value=item["item_name"])
+                e_qty   = st.number_input("Количество", value=float(item["qty"]),  min_value=0.001, step=0.01, format="%.3f")
+                e_unit  = st.selectbox("Ед.", PACKAGING_UNITS, index=PACKAGING_UNITS.index(item["unit"]) if item["unit"] in PACKAGING_UNITS else 0)
+            with ec2:
+                e_price = st.number_input("Цена/ед.",   value=float(item["price_unit"] or 0), min_value=0.0, step=0.01, format="%.3f")
+                e_supp  = st.text_input("Поставщик",   value=item["supplier"] or "")
+                e_notes = st.text_input("Примечание",  value=item["notes"] or "")
+
+            if st.form_submit_button("💾 Сохранить изменения", use_container_width=True):
+                buf[idx] = {
+                    "recv_date":  e_date.isoformat(),
+                    "item_name":  e_name.strip(),
+                    "qty":        e_qty,
+                    "unit":       e_unit,
+                    "price_unit": e_price or None,
+                    "total":      round(e_qty * e_price, 3) if e_price else None,
+                    "supplier":   e_supp.strip() or None,
+                    "notes":      e_notes.strip() or None,
+                }
+                st.success("Позиция обновлена")
+                st.rerun()
+
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            if st.button(f"🗑 Удалить позицию #{idx + 1}", use_container_width=True):
+                buf.pop(idx)
+                st.rerun()
+        with c2:
+            if st.button("🗑 Очистить весь буфер", use_container_width=True):
+                buf.clear()
+                st.rerun()
+        with c3:
+            if st.button(f"✅ Сохранить на склад ({len(buf)} поз.)", type="primary", use_container_width=True):
+                for r in buf:
+                    db_run(
+                        """INSERT INTO packaging_receipts
+                            (receipt_date, item_name, quantity, unit,
+                             price_per_unit, total_price, supplier, notes, created_by)
+                           VALUES (?,?,?,?,?,?,?,?,?)""",
+                        (r["recv_date"], r["item_name"], r["qty"], r["unit"],
+                         r["price_unit"], r["total"], r["supplier"], r["notes"], user),
+                    )
+                n = len(buf)
+                buf.clear()
+                st.success(f"✅ Сохранено на склад: {n} позиций")
+                st.rerun()
+
+    st.divider()
+    st.markdown("#### Записи упаковки и материалов")
+    rows = db_query(
+        "SELECT receipt_date,item_name,quantity,unit,price_per_unit,total_price,supplier,notes "
+        "FROM packaging_receipts ORDER BY id DESC LIMIT 50"
+    )
+    if rows:
+        df = pd.DataFrame(rows)
+        df.columns = ["Дата", "Наименование", "Кол-во", "Ед.", "Цена/ед.", "Сумма", "Поставщик", "Примечание"]
+        st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Нет записей")
+
+# ─── MAIN ─────────────────────────────────────────────────────────────────────
+
+def main():
+    init_db()
+    inject_css()
+    auth_script()
+
+    if "page" not in st.session_state:
+        st.session_state.page = "home"
+
+    token = st.query_params.get("auth")
+    if isinstance(token, list):
+        token = token[0] if token else None
+    username = check_token(token) if token else None
+    if username:
+        st.session_state.current_user = username
+
+    if "current_user" not in st.session_state:
+        page_login()
+        return
+
+    pages = {
+        "home":       page_home,
+        "receive":    page_receive,
+        "stock":      page_stock,
+        "writeoff":   page_writeoff,
+        "production": page_production,
+        "packaging":  page_packaging,
+    }
+    fn = pages.get(st.session_state.page)
+    if fn:
+        fn()
+    else:
+        st.session_state.page = "home"
+        st.rerun()
+
+
+if __name__ == "__main__":
+    main()
