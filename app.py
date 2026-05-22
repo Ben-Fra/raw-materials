@@ -381,7 +381,7 @@ def page_receive():
         col1, col2 = st.columns(2)
         with col1:
             recv_date       = st.date_input("Дата получения", value=date.today())
-            order_no        = st.text_input("Номер товарной накладной")
+            order_no        = st.text_input("Номер документа")
             supplier_sel    = st.selectbox("Поставщик (ספק)", [""] + SUPPLIERS + [MANUAL])
             supplier_manual = st.text_input("Поставщик — вручную", placeholder="Введите название") if supplier_sel == MANUAL else ""
             material_sel    = st.selectbox("Товар (סחורה)", [""] + RAW_MATERIALS + [MANUAL])
@@ -428,7 +428,7 @@ def page_receive():
     else:
         df_buf = pd.DataFrame([{
             "№": i + 1,
-            "Дата": r["recv_date"], "№ накладной": r["order_no"],
+            "Дата": r["recv_date"], "№ документа": r["order_no"],
             "Поставщик": r["supplier"], "Товар": r["material"],
             "Кг": r["qty_kg"], "Цена/кг": r["price_kg"] or "",
             "Сумма": r["total"] or "",
@@ -449,7 +449,7 @@ def page_receive():
             ec1, ec2 = st.columns(2)
             with ec1:
                 e_date     = st.date_input("Дата",          value=date.fromisoformat(item["recv_date"]))
-                e_order    = st.text_input("Номер товарной накладной", value=item["order_no"])
+                e_order    = st.text_input("Номер документа", value=item["order_no"])
                 e_supplier = st.text_input("Поставщик",      value=item["supplier"])
                 e_material = st.text_input("Товар",          value=item["material"])
             with ec2:
@@ -509,7 +509,7 @@ def page_receive():
     )
     if rows:
         df = pd.DataFrame(rows)
-        df.columns = ["Дата", "№ накладной", "Поставщик", "Товар", "Кг", "Цена/кг", "Сумма", "Годен до"]
+        df.columns = ["Дата", "№ документа", "Поставщик", "Товар", "Кг", "Цена/кг", "Сумма", "Годен до"]
         st.dataframe(df, use_container_width=True, hide_index=True)
     else:
         st.info("Нет поступлений")
@@ -563,7 +563,7 @@ def page_stock():
         "price_per_kg", "production_date", "expiry_date",
     ]].copy()
     display.columns = [
-        "Дата прихода", "№ накладной", "Поставщик", "Товар",
+        "Дата прихода", "№ документа", "Поставщик", "Товар",
         "Принято кг", "Списано кг", "Остаток кг",
         "Цена/кг", "Дата произв.", "Годен до",
     ]
@@ -785,7 +785,7 @@ def page_production():
         unsafe_allow_html=True,
     )
 
-    df.columns = ["Партия", "Дата списания", "Товар", "Поставщик", "Кг", "Примечание", "№ накладной", "Годен до"]
+    df.columns = ["Партия", "Дата списания", "Товар", "Поставщик", "Кг", "Примечание", "№ документа", "Годен до"]
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.divider()
