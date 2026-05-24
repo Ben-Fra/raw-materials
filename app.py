@@ -597,6 +597,35 @@ def page_stock():
             summary.to_excel(w, index=False, sheet_name="По товарам")
         st.download_button("⬇ Скачать файл", buf.getvalue(), "остатки_сырья.xlsx")
 
+    # ── Удаление записи (только Admin) ──
+    if st.session_state.get("current_user") == "Admin":
+        st.divider()
+        st.markdown("#### 🗑 Удалить запись прихода (Admin)")
+        all_receipts = db_query(
+            "SELECT id, receipt_date, order_number, supplier, material, quantity_kg "
+            "FROM raw_receipts ORDER BY id DESC LIMIT 200"
+        )
+        if all_receipts:
+            id_map = {
+                r["id"]: f'{r["receipt_date"]} | №{r["order_number"]} | {r["supplier"]} | {r["material"]} | {r["quantity_kg"]:,.3f} кг'
+                for r in all_receipts
+            }
+            with st.form("delete_receipt_form"):
+                del_id = st.selectbox(
+                    "Выберите запись для удаления",
+                    list(id_map.keys()),
+                    format_func=lambda i: id_map[i],
+                )
+                confirmed = st.checkbox("Подтверждаю удаление выбранной записи")
+                if st.form_submit_button("🗑 Удалить запись", type="primary"):
+                    if not confirmed:
+                        st.error("Поставьте галочку подтверждения")
+                    else:
+                        db_run("DELETE FROM production_writeoffs WHERE receipt_id = ?", (del_id,))
+                        db_run("DELETE FROM raw_receipts WHERE id = ?", (del_id,))
+                        st.success(f"✅ Запись удалена: {id_map[del_id]}")
+                        st.rerun()
+
 # ─── WRITE-OFF ────────────────────────────────────────────────────────────────
 
 def page_writeoff():
@@ -742,15 +771,42 @@ def page_writeoff():
     st.divider()
     st.markdown("#### История списаний")
     hist = db_query(
-        "SELECT batch_number,writeoff_date,material,supplier,quantity_kg,notes,created_by "
+        "SELECT id,batch_number,writeoff_date,material,supplier,quantity_kg,notes,created_by "
         "FROM production_writeoffs ORDER BY id DESC LIMIT 30"
     )
     if hist:
         df = pd.DataFrame(hist)
-        df.columns = ["Партия", "Дата", "Товар", "Поставщик", "Кг", "Примечание", "Оператор"]
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        df.columns = ["id", "Партия", "Дата", "Товар", "Поставщик", "Кг", "Примечание", "Оператор"]
+        st.dataframe(df.drop(columns=["id"]), use_container_width=True, hide_index=True)
     else:
         st.info("Нет списаний")
+
+    # ── Удаление записи (только Admin) ──
+    if st.session_state.current_user == "Admin" and hist:
+        st.divider()
+        st.markdown("#### 🗑 Удалить запись списания (Admin)")
+        rows_for_del = db_query(
+            "SELECT id,batch_number,writeoff_date,material,supplier,quantity_kg "
+            "FROM production_writeoffs ORDER BY id DESC LIMIT 100"
+        )
+        id_map = {
+            r["id"]: f'{r["writeoff_date"]} | {r["batch_number"]} | {r["material"]} | {r["supplier"]} | {r["quantity_kg"]:,.3f} кг'
+            for r in rows_for_del
+        }
+        with st.form("delete_writeoff_form"):
+            del_id = st.selectbox(
+                "Выберите запись для удаления",
+                list(id_map.keys()),
+                format_func=lambda i: id_map[i],
+            )
+            confirmed = st.checkbox("Подтверждаю удаление выбранной записи")
+            if st.form_submit_button("🗑 Удалить запись", type="primary"):
+                if not confirmed:
+                    st.error("Поставьте галочку подтверждения")
+                else:
+                    db_run("DELETE FROM production_writeoffs WHERE id = ?", (del_id,))
+                    st.success(f"✅ Запись удалена: {id_map[del_id]}")
+                    st.rerun()
 
 # ─── PRODUCTION ───────────────────────────────────────────────────────────────
 
