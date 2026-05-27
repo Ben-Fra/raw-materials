@@ -361,6 +361,8 @@ def page_home():
             st.session_state.page = "production"; st.rerun()
         if st.button("📦 Упаковка и материалы (склад №5)", key="nav_pack"):
             st.session_state.page = "packaging"; st.rerun()
+        if st.button("📅 Журнал остатков", key="nav_journal"):
+            st.session_state.page = "journal"; st.rerun()
 
     st.divider()
 
@@ -1022,6 +1024,94 @@ def page_packaging():
     else:
         st.info("Нет записей")
 
+# ─── JOURNAL ─────────────────────────────────────────────────────────────────
+
+def page_journal():
+    st.markdown('<div class="page-title">📅 Журнал остатков</div>', unsafe_allow_html=True)
+    back_btn()
+
+    sel_date = st.date_input("Выберите дату", value=date.today(), max_value=date.today())
+    date_str = sel_date.isoformat()
+
+    st.markdown(f"### Склад №2 — Сырьё на {sel_date.strftime('%d.%m.%Y')}")
+
+    stock_rows = db_query(f"""
+        SELECT
+            rr.material,
+            rr.supplier,
+            rr.order_number,
+            rr.quantity_kg,
+            rr.price_per_kg,
+            rr.expiry_date,
+            COALESCE(SUM(pw.quantity_kg), 0) AS written_off,
+            rr.quantity_kg - COALESCE(SUM(pw.quantity_kg), 0) AS remaining_kg
+        FROM raw_receipts rr
+        LEFT JOIN production_writeoffs pw
+            ON pw.receipt_id = rr.id
+            AND pw.writeoff_date <= ?
+        WHERE rr.receipt_date <= ?
+        GROUP BY rr.id
+        HAVING rr.quantity_kg - COALESCE(SUM(pw.quantity_kg), 0) > 0.001
+        ORDER BY rr.expiry_date ASC
+    """, (date_str, date_str))
+
+    if stock_rows:
+        df_stock = pd.DataFrame(stock_rows)
+        df_stock.insert(0, "Товар", df_stock["material"].map(lambda h: MATERIALS_MAP.get(h, h)))
+        total_remain = df_stock["remaining_kg"].sum()
+        total_value  = (df_stock["remaining_kg"] * df_stock["price_per_kg"].fillna(0)).sum()
+        c1, c2 = st.columns(2)
+        c1.markdown(f'<div class="metric-card"><h2>{total_remain:,.0f} кг</h2><p>Остаток сырья</p></div>'.replace(",", " "), unsafe_allow_html=True)
+        c2.markdown(f'<div class="metric-card"><h2>{total_value:,.0f}</h2><p>Стоимость остатка</p></div>'.replace(",", " "), unsafe_allow_html=True)
+        df_stock["Стоимость"] = (df_stock["remaining_kg"] * df_stock["price_per_kg"].fillna(0)).round(2)
+        display = df_stock[["Товар", "material", "supplier", "order_number",
+                             "quantity_kg", "written_off", "remaining_kg",
+                             "price_per_kg", "Стоимость", "expiry_date"]].copy()
+        display.columns = ["Товар", "Товар (иврит)", "Поставщик", "№ документа",
+                            "Принято кг", "Списано кг", "Остаток кг",
+                            "Цена/кг", "Стоимость", "Годен до"]
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+        if st.button("📥 Скачать Excel (склад №2)", key="dl_journal_stock"):
+            from io import BytesIO
+            buf = BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as w:
+                display.to_excel(w, index=False, sheet_name="Склад №2")
+            st.download_button("⬇ Скачать", buf.getvalue(),
+                               f"склад2_{date_str}.xlsx")
+    else:
+        st.info("На эту дату данных нет")
+
+    st.divider()
+    st.markdown(f"### Склад №3 — Сырьё в производстве на {sel_date.strftime('%d.%m.%Y')}")
+
+    prod_rows = db_query(f"""
+        SELECT
+            pw.writeoff_date,
+            pw.material,
+            pw.supplier,
+            pw.quantity_kg,
+            pw.batch_number,
+            rr.expiry_date
+        FROM production_writeoffs pw
+        JOIN raw_receipts rr ON rr.id = pw.receipt_id
+        WHERE pw.writeoff_date <= ?
+        ORDER BY pw.writeoff_date DESC
+    """, (date_str,))
+
+    if prod_rows:
+        df_prod = pd.DataFrame(prod_rows)
+        df_prod.insert(1, "Товар", df_prod["material"].map(lambda h: MATERIALS_MAP.get(h, h)))
+        total_prod = df_prod["quantity_kg"].sum()
+        st.markdown(f'<div class="metric-card"><h2>{total_prod:,.0f} кг</h2><p>Всего в производстве</p></div>'.replace(",", " "), unsafe_allow_html=True)
+        display_prod = df_prod[["writeoff_date", "Товар", "material", "supplier",
+                                 "quantity_kg", "batch_number", "expiry_date"]].copy()
+        display_prod.columns = ["Дата списания", "Товар", "Товар (иврит)",
+                                 "Поставщик", "Кг", "Партия", "Годен до"]
+        st.dataframe(display_prod, use_container_width=True, hide_index=True)
+    else:
+        st.info("На эту дату данных нет")
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
@@ -1051,6 +1141,7 @@ def main():
         "writeoff":   page_writeoff,
         "production": page_production,
         "packaging":  page_packaging,
+        "journal":    page_journal,
     }
     fn = pages.get(st.session_state.page)
     if fn:
