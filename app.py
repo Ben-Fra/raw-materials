@@ -14,14 +14,27 @@ APP_TZ       = ZoneInfo("Asia/Jerusalem")
 AUTH_DAYS    = 30
 STATIC_BASE  = "/app/static"
 
-RAW_MATERIALS = sorted(set([
-    "דג דניס", "הרינג 350+", "ורדון", "ורדון ללא ראש", "טונה חומה",
-    "לש 0.8+", "לש 1.2+", "לש 1.5+", "לשונון", "מקרל 500+",
-    "מקרל 600+", "מקרל 600+ G", "סלקה 12-15", "סלקה 16+",
-    "פילה הרינג", "פילה הרינג 4-7", "פילה הרינג 60-100",
-    "פילה סלמון", "פילה סלמון נורבגי", "פילה סלמון טרי",
-    "פילה סלמון קפוא", "פורל ים ללא ראש", "קפלין 23-25",
-]))
+def _load_materials():
+    import csv
+    path = BASE_DIR / "materials.csv"
+    mapping = {}
+    if path.exists():
+        with open(path, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                heb = row.get("hebrew", "").strip()
+                rus = row.get("russian", "").strip()
+                if heb:
+                    mapping[heb] = rus
+    return mapping
+
+MATERIALS_MAP = _load_materials()   # {hebrew: russian}
+RAW_MATERIALS = sorted(MATERIALS_MAP.keys()) if MATERIALS_MAP else []
+
+def material_display(heb):
+    """Показывает русское название + иврит в скобках."""
+    rus = MATERIALS_MAP.get(heb, "")
+    return f"{rus}  |  {heb}" if rus else heb
 
 SUPPLIERS = ["גו פיש", "לנדוי", "צ'ירינה"]
 
@@ -391,7 +404,8 @@ def page_receive():
             delivery_code   = st.text_input("Код поставки")
             supplier_sel    = st.selectbox("Поставщик (ספק)", [""] + SUPPLIERS + [MANUAL])
             supplier_manual = st.text_input("Поставщик — вручную", placeholder="Введите название") if supplier_sel == MANUAL else ""
-            material_sel    = st.selectbox("Товар (סחורה)", [""] + RAW_MATERIALS + [MANUAL])
+            material_sel    = st.selectbox("Товар (סחורה)", [""] + RAW_MATERIALS + [MANUAL],
+                                format_func=lambda x: material_display(x) if x and x != MANUAL else x)
             material_manual = st.text_input("Товар — вручную", placeholder="Введите название") if material_sel == MANUAL else ""
         with col2:
             qty_kg    = st.number_input("Количество кг", min_value=0.0, step=0.001, format="%.3f")
@@ -574,14 +588,15 @@ def page_stock():
         "price_per_kg", "supplier", "order_number", "delivery_code", "expiry_date",
     ]].copy()
     display.columns = [
-        "Дата прихода", "Товар", "Остаток кг", "Принято кг", "Списано кг",
+        "Дата прихода", "Товар (иврит)", "Остаток кг", "Принято кг", "Списано кг",
         "Цена/кг", "Поставщик", "№ документа", "Код поставки", "Годен до",
     ]
+    display.insert(1, "Товар", display["Товар (иврит)"].map(lambda h: MATERIALS_MAP.get(h, h)))
     display["Стоимость остатка"] = (
         display["Остаток кг"] * display["Цена/кг"].fillna(0)
     ).round(2)
     display = display[[
-        "Дата прихода", "Товар", "Остаток кг", "Принято кг", "Списано кг",
+        "Дата прихода", "Товар", "Товар (иврит)", "Остаток кг", "Принято кг", "Списано кг",
         "Стоимость остатка", "Поставщик", "Цена/кг", "№ документа", "Код поставки", "Годен до",
     ]]
 
@@ -851,7 +866,8 @@ def page_production():
         unsafe_allow_html=True,
     )
 
-    df.columns = ["Партия", "Дата списания", "Товар", "Поставщик", "Кг", "Примечание", "№ документа", "Код поставки", "Годен до"]
+    df.columns = ["Партия", "Дата списания", "Товар (иврит)", "Поставщик", "Кг", "Примечание", "№ документа", "Код поставки", "Годен до"]
+    df.insert(2, "Товар", df["Товар (иврит)"].map(lambda h: MATERIALS_MAP.get(h, h)))
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.divider()
