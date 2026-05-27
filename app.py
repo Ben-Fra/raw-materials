@@ -351,8 +351,8 @@ def page_home():
     remain  = raw_kg - wo_kg
 
     c1, c2, c3 = st.columns(3)
-    c1.markdown(f'<div class="metric-card"><h2>{remain:,.0f} кг</h2><p>Остаток сырья (склад №2)</p></div>', unsafe_allow_html=True)
-    c2.markdown(f'<div class="metric-card"><h2>{wo_kg:,.0f} кг</h2><p>Отправлено в производство</p></div>', unsafe_allow_html=True)
+    c1.markdown(f'<div class="metric-card"><h2>{remain:,.0f} кг</h2><p>Остаток сырья (склад №2)</p></div>'.replace(",", " "), unsafe_allow_html=True)
+    c2.markdown(f'<div class="metric-card"><h2>{wo_kg:,.0f} кг</h2><p>Отправлено в производство</p></div>'.replace(",", " "), unsafe_allow_html=True)
     c3.markdown(f'<div class="metric-card"><h2>{pack_n}</h2><p>Записей упаковки (склад №5)</p></div>', unsafe_allow_html=True)
 
     st.divider()
@@ -558,18 +558,20 @@ def page_stock():
     soon  = (date.today() + timedelta(days=30)).isoformat()
 
     display = df[[
-        "receipt_date", "order_number", "supplier", "material",
-        "quantity_kg", "written_off", "remaining_kg",
-        "price_per_kg", "expiry_date",
+        "receipt_date", "material", "remaining_kg", "quantity_kg", "written_off",
+        "price_per_kg", "supplier", "order_number", "expiry_date",
     ]].copy()
     display.columns = [
-        "Дата прихода", "№ документа", "Поставщик", "Товар",
-        "Принято кг", "Списано кг", "Остаток кг",
-        "Цена/кг", "Годен до",
+        "Дата прихода", "Товар", "Остаток кг", "Принято кг", "Списано кг",
+        "Цена/кг", "Поставщик", "№ документа", "Годен до",
     ]
     display["Стоимость остатка"] = (
         display["Остаток кг"] * display["Цена/кг"].fillna(0)
     ).round(2)
+    display = display[[
+        "Дата прихода", "Товар", "Остаток кг", "Принято кг", "Списано кг",
+        "Стоимость остатка", "Поставщик", "Цена/кг", "№ документа", "Годен до",
+    ]]
 
     st.dataframe(display, use_container_width=True, hide_index=True)
 
