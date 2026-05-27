@@ -560,13 +560,16 @@ def page_stock():
     display = df[[
         "receipt_date", "order_number", "supplier", "material",
         "quantity_kg", "written_off", "remaining_kg",
-        "price_per_kg", "production_date", "expiry_date",
+        "price_per_kg", "expiry_date",
     ]].copy()
     display.columns = [
         "Дата прихода", "№ документа", "Поставщик", "Товар",
         "Принято кг", "Списано кг", "Остаток кг",
-        "Цена/кг", "Дата произв.", "Годен до",
+        "Цена/кг", "Годен до",
     ]
+    display["Стоимость остатка"] = (
+        display["Остаток кг"] * display["Цена/кг"].fillna(0)
+    ).round(2)
 
     def highlight(row):
         exp = row["Годен до"]
