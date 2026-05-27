@@ -179,6 +179,12 @@ def init_db():
             conn.commit()
         except Exception:
             pass  # column already exists
+        # Migration: add delivery_code if column doesn't exist yet
+        try:
+            cur.execute("ALTER TABLE raw_receipts ADD COLUMN delivery_code TEXT")
+            conn.commit()
+        except Exception:
+            pass  # column already exists
     finally:
         conn.close()
 
@@ -382,6 +388,7 @@ def page_receive():
         with col1:
             recv_date       = st.date_input("Дата получения", value=date.today())
             order_no        = st.text_input("Номер документа")
+            delivery_code   = st.text_input("Код поставки")
             supplier_sel    = st.selectbox("Поставщик (ספק)", [""] + SUPPLIERS + [MANUAL])
             supplier_manual = st.text_input("Поставщик — вручную", placeholder="Введите название") if supplier_sel == MANUAL else ""
             material_sel    = st.selectbox("Товар (סחורה)", [""] + RAW_MATERIALS + [MANUAL])
@@ -407,15 +414,16 @@ def page_receive():
                 for e in errors: st.error(e)
             else:
                 buf.append({
-                    "recv_date": recv_date.isoformat(),
-                    "order_no":  order_no.strip(),
-                    "supplier":  supplier,
-                    "material":  material,
-                    "qty_kg":    qty_kg,
-                    "price_kg":  price_kg or None,
-                    "total":     total or None,
-                    "prod_date": prod_date.isoformat() if prod_date else None,
-                    "exp_date":  exp_date.isoformat()  if exp_date  else None,
+                    "recv_date":     recv_date.isoformat(),
+                    "order_no":      order_no.strip(),
+                    "delivery_code": delivery_code.strip() or None,
+                    "supplier":      supplier,
+                    "material":      material,
+                    "qty_kg":        qty_kg,
+                    "price_kg":      price_kg or None,
+                    "total":         total or None,
+                    "prod_date":     prod_date.isoformat() if prod_date else None,
+                    "exp_date":      exp_date.isoformat()  if exp_date  else None,
                 })
                 st.success(f"Добавлено в буфер: {material} — {qty_kg:,.3f} кг")
 
@@ -429,6 +437,7 @@ def page_receive():
         df_buf = pd.DataFrame([{
             "№": i + 1,
             "Дата": r["recv_date"], "№ документа": r["order_no"],
+            "Код поставки": r.get("delivery_code") or "",
             "Поставщик": r["supplier"], "Товар": r["material"],
             "Кг": r["qty_kg"], "Цена/кг": r["price_kg"] or "",
             "Сумма": r["total"] or "",
@@ -450,6 +459,7 @@ def page_receive():
             with ec1:
                 e_date     = st.date_input("Дата",          value=date.fromisoformat(item["recv_date"]))
                 e_order    = st.text_input("Номер документа", value=item["order_no"])
+                e_delivery = st.text_input("Код поставки",    value=item.get("delivery_code") or "")
                 e_supplier = st.text_input("Поставщик",      value=item["supplier"])
                 e_material = st.text_input("Товар",          value=item["material"])
             with ec2:
@@ -460,15 +470,16 @@ def page_receive():
 
             if st.form_submit_button("💾 Сохранить изменения", use_container_width=True):
                 buf[idx] = {
-                    "recv_date": e_date.isoformat(),
-                    "order_no":  e_order.strip(),
-                    "supplier":  e_supplier.strip(),
-                    "material":  e_material.strip(),
-                    "qty_kg":    e_qty,
-                    "price_kg":  e_price or None,
-                    "total":     round(e_qty * e_price, 3) if e_price else None,
-                    "prod_date": e_prod.isoformat() if e_prod else None,
-                    "exp_date":  e_exp.isoformat()  if e_exp  else None,
+                    "recv_date":     e_date.isoformat(),
+                    "order_no":      e_order.strip(),
+                    "delivery_code": e_delivery.strip() or None,
+                    "supplier":      e_supplier.strip(),
+                    "material":      e_material.strip(),
+                    "qty_kg":        e_qty,
+                    "price_kg":      e_price or None,
+                    "total":         round(e_qty * e_price, 3) if e_price else None,
+                    "prod_date":     e_prod.isoformat() if e_prod else None,
+                    "exp_date":      e_exp.isoformat()  if e_exp  else None,
                 }
                 st.success("Позиция обновлена")
                 st.rerun()
@@ -487,11 +498,11 @@ def page_receive():
                 for r in buf:
                     db_run(
                         """INSERT INTO raw_receipts
-                            (receipt_date, order_number, supplier, material,
+                            (receipt_date, order_number, delivery_code, supplier, material,
                              quantity_kg, price_per_kg, total_price,
                              production_date, expiry_date, created_by)
-                           VALUES (?,?,?,?,?,?,?,?,?,?)""",
-                        (r["recv_date"], r["order_no"], r["supplier"], r["material"],
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                        (r["recv_date"], r["order_no"], r.get("delivery_code"), r["supplier"], r["material"],
                          r["qty_kg"], r["price_kg"], r["total"],
                          r["prod_date"], r["exp_date"], user),
                     )
@@ -525,6 +536,7 @@ def page_stock():
             rr.id,
             rr.receipt_date,
             rr.order_number,
+            rr.delivery_code,
             rr.supplier,
             rr.material,
             rr.quantity_kg,
@@ -559,18 +571,18 @@ def page_stock():
 
     display = df[[
         "receipt_date", "material", "remaining_kg", "quantity_kg", "written_off",
-        "price_per_kg", "supplier", "order_number", "expiry_date",
+        "price_per_kg", "supplier", "order_number", "delivery_code", "expiry_date",
     ]].copy()
     display.columns = [
         "Дата прихода", "Товар", "Остаток кг", "Принято кг", "Списано кг",
-        "Цена/кг", "Поставщик", "№ документа", "Годен до",
+        "Цена/кг", "Поставщик", "№ документа", "Код поставки", "Годен до",
     ]
     display["Стоимость остатка"] = (
         display["Остаток кг"] * display["Цена/кг"].fillna(0)
     ).round(2)
     display = display[[
         "Дата прихода", "Товар", "Остаток кг", "Принято кг", "Списано кг",
-        "Стоимость остатка", "Поставщик", "Цена/кг", "№ документа", "Годен до",
+        "Стоимость остатка", "Поставщик", "Цена/кг", "№ документа", "Код поставки", "Годен до",
     ]]
 
     st.dataframe(display, use_container_width=True, hide_index=True)
@@ -820,6 +832,7 @@ def page_production():
             pw.quantity_kg,
             pw.notes,
             rr.order_number,
+            rr.delivery_code,
             rr.expiry_date
         FROM production_writeoffs pw
         JOIN raw_receipts rr ON rr.id = pw.receipt_id
@@ -838,7 +851,7 @@ def page_production():
         unsafe_allow_html=True,
     )
 
-    df.columns = ["Партия", "Дата списания", "Товар", "Поставщик", "Кг", "Примечание", "№ документа", "Годен до"]
+    df.columns = ["Партия", "Дата списания", "Товар", "Поставщик", "Кг", "Примечание", "№ документа", "Код поставки", "Годен до"]
     st.dataframe(df, use_container_width=True, hide_index=True)
 
     st.divider()
