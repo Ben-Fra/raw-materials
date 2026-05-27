@@ -695,25 +695,37 @@ def page_writeoff():
     if not stock_avail:
         st.warning("Всё доступное сырьё уже добавлено в буфер.")
     else:
-        options = [
-            f"{r['material']} | {r['supplier']} | доступно: {available[r['id']]:,.3f} кг"
-            f" | до: {r['expiry_date'] or '—'} | #{r['id']}"
-            for r in stock_avail
+        search = st.text_input("🔍 Поиск по названию (на русском)", placeholder="Например: скумб")
+        filtered = [
+            r for r in stock_avail
+            if not search.strip() or search.strip().lower() in MATERIALS_MAP.get(r["material"], r["material"]).lower()
         ]
+        if not filtered:
+            st.warning("Ничего не найдено. Попробуйте другой запрос.")
+        else:
+            options = [r["id"] for r in filtered]
+            def wo_label(rid):
+                r = next(x for x in filtered if x["id"] == rid)
+                rus = MATERIALS_MAP.get(r["material"], r["material"])
+                return (f"{rus} | {r['supplier']} | доступно: {available[rid]:,.3f} кг"
+                        f" | до: {r['expiry_date'] or '—'}")
         with st.form("wo_form", clear_on_submit=True):
-            selected = st.selectbox("Выберите позицию со склада №2", options)
+            selected_id = st.selectbox("Выберите позицию со склада №2", options if filtered else [None],
+                                       format_func=wo_label if filtered else lambda x: "—")
+            selected = f"#{selected_id}" if selected_id else None
             wo_qty   = st.number_input("Количество для списания (кг)", min_value=0.001, step=0.001, format="%.3f")
             wo_date  = st.date_input("Дата списания", value=date.today())
             notes    = st.text_input("Примечание (необязательно)")
 
             if st.form_submit_button("➕ Добавить в буфер", type="primary", use_container_width=True):
-                rid = int(selected.rsplit("#", 1)[1])
+                rid = selected_id
                 row = next(r for r in stock if r["id"] == rid)
                 avail = available[rid]
                 if wo_qty > avail + 0.001:
                     st.error(f"Нельзя добавить {wo_qty:,.3f} кг — доступно только {avail:,.3f} кг")
                 else:
-                    batch = f"{row['material']} {wo_date.strftime('%d/%m/%y')}"
+                    rus = MATERIALS_MAP.get(row["material"], row["material"])
+                    batch = f"{rus} {wo_date.strftime('%d/%m/%y')}"
                     buf.append({
                         "receipt_id":   rid,
                         "material":     row["material"],
@@ -723,7 +735,7 @@ def page_writeoff():
                         "batch_number": batch,
                         "notes":        notes.strip() or None,
                     })
-                    st.success(f"Добавлено в буфер: {row['material']} — {wo_qty:,.3f} кг | Партия: {batch}")
+                    st.success(f"Добавлено в буфер: {rus} — {wo_qty:,.3f} кг | Партия: {batch}")
 
     # ── Буфер ──
     st.divider()
