@@ -36,9 +36,30 @@ def material_display(heb):
     rus = MATERIALS_MAP.get(heb, "")
     return f"{rus}  |  {heb}" if rus else heb
 
+
+def _load_packaging_items():
+    import csv
+    path = BASE_DIR / "packaging_items.csv"
+    items = []
+    if path.exists():
+        with open(path, encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                name = row.get("name", "").strip()
+                unit = row.get("unit", "шт").strip()
+                article = row.get("article", "").strip()
+                if name:
+                    items.append({"name": name, "unit": unit, "article": article})
+    return items
+
+PACKAGING_ITEMS      = _load_packaging_items()
+PACKAGING_ITEMS_NAMES = [x["name"] for x in PACKAGING_ITEMS]
+# unit lookup by name
+PACKAGING_ITEMS_UNIT  = {x["name"]: x["unit"] for x in PACKAGING_ITEMS}
+
 SUPPLIERS = ["גו פיש", "לנדוי", "צ'ירינה"]
 
-PACKAGING_UNITS = ["кг", "шт", "л", "рулон", "коробка", "мешок", "м"]
+PACKAGING_UNITS = ["шт", "кг", "упаковка", "л", "литр", "пакет", "рулон", "коробка", "мешок", "м"]
 
 # ─── AUTH ─────────────────────────────────────────────────────────────────────
 
@@ -903,30 +924,42 @@ def page_packaging():
 
     # ── Форма добавления в буфер ──
     st.markdown("#### Добавить позицию в буфер")
+    MANUAL = "✏️ Ввести вручную..."
     with st.form("pack_form", clear_on_submit=True):
         col1, col2 = st.columns(2)
         with col1:
-            recv_date  = st.date_input("Дата получения", value=date.today())
-            item_name  = st.text_input("Наименование")
-            qty        = st.number_input("Количество", min_value=0.0, step=0.01, format="%.3f")
-            unit       = st.selectbox("Единица измерения", PACKAGING_UNITS)
+            recv_date = st.date_input("Дата получения", value=date.today())
+            item_sel  = st.selectbox(
+                "Наименование",
+                [""] + PACKAGING_ITEMS_NAMES + [MANUAL],
+            )
+            if item_sel == MANUAL:
+                item_manual = st.text_input("Наименование — вручную", placeholder="Введите наименование")
+            else:
+                item_manual = ""
+            # Определяем единицу измерения по выбранной позиции
+            auto_unit = PACKAGING_ITEMS_UNIT.get(item_sel, "шт")
+            unit_idx  = PACKAGING_UNITS.index(auto_unit) if auto_unit in PACKAGING_UNITS else 0
+            unit = st.selectbox("Единица измерения", PACKAGING_UNITS, index=unit_idx)
+            qty  = st.number_input("Количество", min_value=0.0, step=0.01, format="%.3f")
         with col2:
             price_unit = st.number_input("Цена за единицу", min_value=0.0, step=0.01, format="%.3f")
             supplier   = st.text_input("Поставщик")
             notes      = st.text_input("Примечание")
 
+        item_name = item_manual.strip() if item_sel == MANUAL else item_sel
         total = round(qty * price_unit, 3) if qty and price_unit else 0.0
         st.markdown(f"**Общая сумма: {total:,.3f}**")
 
         if st.form_submit_button("➕ Добавить в буфер", type="primary", use_container_width=True):
-            if not item_name.strip():
-                st.error("Укажите наименование")
+            if not item_name:
+                st.error("Выберите наименование из списка или введите вручную")
             elif qty <= 0:
                 st.error("Количество должно быть больше 0")
             else:
                 buf.append({
                     "recv_date":  recv_date.isoformat(),
-                    "item_name":  item_name.strip(),
+                    "item_name":  item_name,
                     "qty":        qty,
                     "unit":       unit,
                     "price_unit": price_unit or None,
