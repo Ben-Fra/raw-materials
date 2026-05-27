@@ -1145,6 +1145,60 @@ def page_journal():
     else:
         st.info("На эту дату данных нет")
 
+    st.divider()
+    st.markdown(f"### Склад №5 — Упаковка и материалы на {sel_date.strftime('%d.%m.%Y')}")
+
+    pack_rows = db_query("""
+        SELECT
+            item_name,
+            unit,
+            COUNT(*)          AS записей,
+            SUM(quantity)     AS total_qty,
+            SUM(COALESCE(total_price, 0)) AS total_cost,
+            MAX(receipt_date) AS last_receipt
+        FROM packaging_receipts
+        WHERE receipt_date <= ?
+        GROUP BY item_name, unit
+        ORDER BY item_name
+    """, (date_str,))
+
+    if pack_rows:
+        df_pack = pd.DataFrame(pack_rows)
+        total_pack_cost = df_pack["total_cost"].sum()
+        st.markdown(
+            f'<div class="metric-card"><h2>{total_pack_cost:,.0f}</h2>'
+            f'<p>Общая стоимость поступлений упаковки</p></div>'.replace(",", " "),
+            unsafe_allow_html=True,
+        )
+        df_pack.columns = ["Наименование", "Ед.", "Кол-во записей",
+                           "Итого кол-во", "Сумма", "Последний приход"]
+        st.dataframe(df_pack, use_container_width=True, hide_index=True)
+
+        st.markdown("##### Детализация приходов склада №5")
+        pack_detail = db_query("""
+            SELECT receipt_date, item_name, quantity, unit,
+                   price_per_unit, total_price, supplier, notes
+            FROM packaging_receipts
+            WHERE receipt_date <= ?
+            ORDER BY receipt_date DESC, id DESC
+        """, (date_str,))
+        if pack_detail:
+            df_det = pd.DataFrame(pack_detail)
+            df_det.columns = ["Дата", "Наименование", "Кол-во", "Ед.",
+                              "Цена/ед.", "Сумма", "Поставщик", "Примечание"]
+            st.dataframe(df_det, use_container_width=True, hide_index=True)
+
+        if st.button("📥 Скачать Excel (склад №5)", key="dl_journal_pack"):
+            from io import BytesIO
+            buf_xl = BytesIO()
+            with pd.ExcelWriter(buf_xl, engine="openpyxl") as w:
+                df_pack.to_excel(w, index=False, sheet_name="Итого по позициям")
+                pd.DataFrame(pack_detail).to_excel(w, index=False, sheet_name="Детализация")
+            st.download_button("⬇ Скачать", buf_xl.getvalue(),
+                               f"склад5_{date_str}.xlsx")
+    else:
+        st.info("На эту дату данных нет")
+
 # ─── MAIN ─────────────────────────────────────────────────────────────────────
 
 def main():
