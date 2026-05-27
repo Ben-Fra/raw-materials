@@ -551,8 +551,8 @@ def page_stock():
     total_value  = (df["remaining_kg"] * df["price_per_kg"].fillna(0)).sum()
 
     c1, c2 = st.columns(2)
-    c1.markdown(f'<div class="metric-card"><h2>{total_remain:,.0f} кг</h2><p>Общий остаток</p></div>', unsafe_allow_html=True)
-    c2.markdown(f'<div class="metric-card"><h2>{total_value:,.0f}</h2><p>Стоимость остатка</p></div>', unsafe_allow_html=True)
+    c1.markdown(f'<div class="metric-card"><h2>{total_remain:,.0f} кг</h2><p>Общий остаток</p></div>'.replace(",", " "), unsafe_allow_html=True)
+    c2.markdown(f'<div class="metric-card"><h2>{total_value:,.0f}</h2><p>Стоимость остатка</p></div>'.replace(",", " "), unsafe_allow_html=True)
 
     today = date.today().isoformat()
     soon  = (date.today() + timedelta(days=30)).isoformat()
@@ -571,15 +571,7 @@ def page_stock():
         display["Остаток кг"] * display["Цена/кг"].fillna(0)
     ).round(2)
 
-    def highlight(row):
-        exp = row["Годен до"]
-        if exp and str(exp) < today:
-            return ["background-color:#FFEBEE"] * len(row)
-        if exp and str(exp) < soon:
-            return ["background-color:#FFF9C4"] * len(row)
-        return [""] * len(row)
-
-    st.dataframe(display.style.apply(highlight, axis=1), use_container_width=True, hide_index=True)
+    st.dataframe(display, use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("#### По видам сырья")
