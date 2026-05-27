@@ -644,12 +644,13 @@ def page_stock():
             summary.to_excel(w, index=False, sheet_name="По товарам")
         st.download_button("⬇ Скачать файл", buf.getvalue(), "остатки_сырья.xlsx")
 
-    # ── Удаление записи (только Admin) ──
+    # ── Редактирование и удаление (только Admin) ──
     if st.session_state.get("current_user") == "Admin":
         st.divider()
-        st.markdown("#### 🗑 Удалить запись прихода (Admin)")
+        st.markdown("#### ✏️ Редактировать / удалить запись прихода (Admin)")
         all_receipts = db_query(
-            "SELECT id, receipt_date, order_number, supplier, material, quantity_kg "
+            "SELECT id, receipt_date, order_number, delivery_code, supplier, material, "
+            "quantity_kg, price_per_kg, production_date, expiry_date "
             "FROM raw_receipts ORDER BY id DESC LIMIT 200"
         )
         if all_receipts:
@@ -657,21 +658,58 @@ def page_stock():
                 r["id"]: f'{r["receipt_date"]} | №{r["order_number"]} | {r["supplier"]} | {r["material"]} | {r["quantity_kg"]:,.3f} кг'
                 for r in all_receipts
             }
-            with st.form("delete_receipt_form"):
-                del_id = st.selectbox(
-                    "Выберите запись для удаления",
-                    list(id_map.keys()),
-                    format_func=lambda i: id_map[i],
-                )
-                confirmed = st.checkbox("Подтверждаю удаление выбранной записи")
-                if st.form_submit_button("🗑 Удалить запись", type="primary"):
-                    if not confirmed:
-                        st.error("Поставьте галочку подтверждения")
-                    else:
-                        db_run("DELETE FROM production_writeoffs WHERE receipt_id = ?", (del_id,))
-                        db_run("DELETE FROM raw_receipts WHERE id = ?", (del_id,))
-                        st.success(f"✅ Запись удалена: {id_map[del_id]}")
+            selected_edit_id = st.selectbox(
+                "Выберите запись",
+                list(id_map.keys()),
+                format_func=lambda i: id_map[i],
+                key="admin_stock_edit_select",
+            )
+            rec = next(r for r in all_receipts if r["id"] == selected_edit_id)
+
+            tab_edit, tab_del = st.tabs(["✏️ Редактировать", "🗑 Удалить"])
+
+            with tab_edit:
+                with st.form("admin_edit_receipt_form"):
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        e_date     = st.date_input("Дата прихода",    value=date.fromisoformat(rec["receipt_date"]))
+                        e_order    = st.text_input("№ документа",     value=rec["order_number"] or "")
+                        e_delivery = st.text_input("Код поставки",    value=rec["delivery_code"] or "")
+                        e_supplier = st.text_input("Поставщик",       value=rec["supplier"] or "")
+                        e_material = st.text_input("Товар (иврит)",   value=rec["material"] or "")
+                    with ec2:
+                        e_qty   = st.number_input("Количество кг",  value=float(rec["quantity_kg"]),        min_value=0.001, step=0.001, format="%.3f")
+                        e_price = st.number_input("Цена/кг",         value=float(rec["price_per_kg"] or 0), min_value=0.0,   step=0.01,  format="%.3f")
+                        e_prod  = st.date_input("Дата производства", value=date.fromisoformat(rec["production_date"]) if rec["production_date"] else None)
+                        e_exp   = st.date_input("Годен до",          value=date.fromisoformat(rec["expiry_date"])     if rec["expiry_date"]     else None)
+                    if st.form_submit_button("💾 Сохранить изменения", type="primary", use_container_width=True):
+                        db_run(
+                            """UPDATE raw_receipts SET
+                                receipt_date=?, order_number=?, delivery_code=?, supplier=?, material=?,
+                                quantity_kg=?, price_per_kg=?, total_price=?, production_date=?, expiry_date=?
+                               WHERE id=?""",
+                            (e_date.isoformat(), e_order.strip(), e_delivery.strip() or None,
+                             e_supplier.strip(), e_material.strip(),
+                             e_qty, e_price or None, round(e_qty * e_price, 3) if e_price else None,
+                             e_prod.isoformat() if e_prod else None,
+                             e_exp.isoformat()  if e_exp  else None,
+                             selected_edit_id),
+                        )
+                        st.success(f"✅ Запись #{selected_edit_id} обновлена")
                         st.rerun()
+
+            with tab_del:
+                st.warning(f"Будет удалена запись: **{id_map[selected_edit_id]}**")
+                with st.form("delete_receipt_form"):
+                    confirmed = st.checkbox("Подтверждаю удаление выбранной записи")
+                    if st.form_submit_button("🗑 Удалить запись", type="primary"):
+                        if not confirmed:
+                            st.error("Поставьте галочку подтверждения")
+                        else:
+                            db_run("DELETE FROM production_writeoffs WHERE receipt_id = ?", (selected_edit_id,))
+                            db_run("DELETE FROM raw_receipts WHERE id = ?", (selected_edit_id,))
+                            st.success(f"✅ Запись удалена: {id_map[selected_edit_id]}")
+                            st.rerun()
 
 # ─── WRITE-OFF ────────────────────────────────────────────────────────────────
 
@@ -1047,15 +1085,96 @@ def page_packaging():
     st.divider()
     st.markdown("#### Записи упаковки и материалов")
     rows = db_query(
-        "SELECT receipt_date,item_name,quantity,unit,price_per_unit,total_price,supplier,notes "
+        "SELECT id,receipt_date,item_name,quantity,unit,price_per_unit,total_price,supplier,notes "
         "FROM packaging_receipts ORDER BY id DESC LIMIT 50"
     )
     if rows:
-        df = pd.DataFrame(rows)
-        df.columns = ["Дата", "Наименование", "Кол-во", "Ед.", "Цена/ед.", "Сумма", "Поставщик", "Примечание"]
-        st.dataframe(df, use_container_width=True, hide_index=True)
+        df_view = pd.DataFrame(rows)
+        df_view_disp = df_view.drop(columns=["id"])
+        df_view_disp.columns = ["Дата", "Наименование", "Кол-во", "Ед.", "Цена/ед.", "Сумма", "Поставщик", "Примечание"]
+        st.dataframe(df_view_disp, use_container_width=True, hide_index=True)
     else:
         st.info("Нет записей")
+
+    # ── Редактирование и удаление упаковки (только Admin) ──
+    if st.session_state.get("current_user") == "Admin":
+        st.divider()
+        st.markdown("#### ✏️ Редактировать / удалить запись упаковки (Admin)")
+        pack_all = db_query(
+            "SELECT id,receipt_date,item_name,quantity,unit,price_per_unit,supplier,notes "
+            "FROM packaging_receipts ORDER BY id DESC LIMIT 200"
+        )
+        if pack_all:
+            pack_id_map = {
+                r["id"]: f'{r["receipt_date"]} | {r["item_name"]} | {r["quantity"]:,.3f} {r["unit"]}'
+                for r in pack_all
+            }
+            sel_pack_id = st.selectbox(
+                "Выберите запись",
+                list(pack_id_map.keys()),
+                format_func=lambda i: pack_id_map[i],
+                key="admin_pack_edit_select",
+            )
+            prec = next(r for r in pack_all if r["id"] == sel_pack_id)
+
+            ptab_edit, ptab_del = st.tabs(["✏️ Редактировать", "🗑 Удалить"])
+
+            with ptab_edit:
+                MANUAL = "✏️ Ввести вручную..."
+                with st.form("admin_edit_pack_form"):
+                    pc1, pc2 = st.columns(2)
+                    with pc1:
+                        pe_date  = st.date_input("Дата получения", value=date.fromisoformat(prec["receipt_date"]))
+                        # Определяем начальный индекс в списке, если есть
+                        cur_name = prec["item_name"]
+                        name_options = [""] + PACKAGING_ITEMS_NAMES + [MANUAL]
+                        name_idx = name_options.index(cur_name) if cur_name in name_options else len(name_options) - 1
+                        pe_item_sel = st.selectbox("Наименование", name_options, index=name_idx)
+                        if pe_item_sel == MANUAL or pe_item_sel == "":
+                            pe_item_manual = st.text_input("Наименование — вручную", value=cur_name if cur_name not in name_options else "")
+                        else:
+                            pe_item_manual = ""
+                        auto_unit   = PACKAGING_ITEMS_UNIT.get(pe_item_sel, prec["unit"] or "шт")
+                        unit_idx_e  = PACKAGING_UNITS.index(auto_unit) if auto_unit in PACKAGING_UNITS else 0
+                        # Если текущая единица не совпадает с авто — используем текущую
+                        if prec["unit"] in PACKAGING_UNITS and pe_item_sel not in PACKAGING_ITEMS_NAMES:
+                            unit_idx_e = PACKAGING_UNITS.index(prec["unit"])
+                        pe_unit = st.selectbox("Единица измерения", PACKAGING_UNITS, index=unit_idx_e)
+                        pe_qty  = st.number_input("Количество", value=float(prec["quantity"]), min_value=0.001, step=0.01, format="%.3f")
+                    with pc2:
+                        pe_price = st.number_input("Цена/ед.", value=float(prec["price_per_unit"] or 0), min_value=0.0, step=0.01, format="%.3f")
+                        pe_supp  = st.text_input("Поставщик",  value=prec["supplier"] or "")
+                        pe_notes = st.text_input("Примечание", value=prec["notes"] or "")
+
+                    if st.form_submit_button("💾 Сохранить изменения", type="primary", use_container_width=True):
+                        pe_name = pe_item_manual.strip() if (pe_item_sel == MANUAL or pe_item_sel == "") else pe_item_sel
+                        if not pe_name:
+                            st.error("Укажите наименование")
+                        else:
+                            db_run(
+                                """UPDATE packaging_receipts SET
+                                    receipt_date=?, item_name=?, quantity=?, unit=?,
+                                    price_per_unit=?, total_price=?, supplier=?, notes=?
+                                   WHERE id=?""",
+                                (pe_date.isoformat(), pe_name, pe_qty, pe_unit,
+                                 pe_price or None, round(pe_qty * pe_price, 3) if pe_price else None,
+                                 pe_supp.strip() or None, pe_notes.strip() or None,
+                                 sel_pack_id),
+                            )
+                            st.success(f"✅ Запись #{sel_pack_id} обновлена")
+                            st.rerun()
+
+            with ptab_del:
+                st.warning(f"Будет удалена запись: **{pack_id_map[sel_pack_id]}**")
+                with st.form("delete_pack_form"):
+                    p_confirmed = st.checkbox("Подтверждаю удаление")
+                    if st.form_submit_button("🗑 Удалить запись", type="primary"):
+                        if not p_confirmed:
+                            st.error("Поставьте галочку подтверждения")
+                        else:
+                            db_run("DELETE FROM packaging_receipts WHERE id = ?", (sel_pack_id,))
+                            st.success(f"✅ Запись удалена: {pack_id_map[sel_pack_id]}")
+                            st.rerun()
 
 # ─── JOURNAL ─────────────────────────────────────────────────────────────────
 
