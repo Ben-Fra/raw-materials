@@ -201,6 +201,18 @@ def init_db():
             created_at TEXT DEFAULT ({now}),
             created_by TEXT NOT NULL DEFAULT 'unknown'
         )""",
+        f"""CREATE TABLE IF NOT EXISTS production_finished_transfers (
+            id {pk},
+            production_writeoff_id INTEGER NOT NULL,
+            material TEXT NOT NULL,
+            supplier TEXT NOT NULL,
+            quantity_kg REAL NOT NULL,
+            transfer_date TEXT NOT NULL,
+            finished_goods_receipt_id INTEGER,
+            notes TEXT,
+            created_at TEXT DEFAULT ({now}),
+            created_by TEXT NOT NULL DEFAULT 'unknown'
+        )""",
     ]
     try:
         cur = conn.cursor()
@@ -913,6 +925,7 @@ def page_production():
 
     rows = db_query("""
         SELECT
+            pw.id,
             pw.batch_number,
             pw.writeoff_date,
             pw.material,
@@ -921,9 +934,13 @@ def page_production():
             pw.notes,
             rr.order_number,
             rr.delivery_code,
-            rr.expiry_date
+            rr.expiry_date,
+            COALESCE(SUM(pft.quantity_kg), 0) AS transferred_kg
         FROM production_writeoffs pw
         JOIN raw_receipts rr ON rr.id = pw.receipt_id
+        LEFT JOIN production_finished_transfers pft ON pft.production_writeoff_id = pw.id
+        GROUP BY pw.id, pw.batch_number, pw.writeoff_date, pw.material, pw.supplier,
+                 pw.quantity_kg, pw.notes, rr.order_number, rr.delivery_code, rr.expiry_date
         ORDER BY pw.writeoff_date DESC, pw.id DESC
     """)
 
@@ -932,20 +949,36 @@ def page_production():
         return
 
     df = pd.DataFrame(rows)
-    total_kg = df["quantity_kg"].sum()
-    st.markdown(
-        f'<div class="metric-card"><h2>{total_kg:,.0f} кг</h2>'
-        f'<p>Всего отправлено в производство</p></div>',
-        unsafe_allow_html=True,
-    )
+    df["remaining_kg"] = df["quantity_kg"] - df["transferred_kg"]
 
-    df.columns = ["Партия", "Дата списания", "Товар (иврит)", "Поставщик", "Кг", "Примечание", "№ документа", "Код поставки", "Годен до"]
-    df.insert(2, "Товар", df["Товар (иврит)"].map(lambda h: MATERIALS_MAP.get(h, h)))
-    st.dataframe(df, use_container_width=True, hide_index=True)
+    total_kg       = df["quantity_kg"].sum()
+    transferred_kg = df["transferred_kg"].sum()
+    remaining_kg   = df["remaining_kg"].sum()
+
+    c1, c2, c3 = st.columns(3)
+    c1.markdown(f'<div class="metric-card"><h2>{total_kg:,.0f} кг</h2><p>Отправлено в производство</p></div>'.replace(",", " "), unsafe_allow_html=True)
+    c2.markdown(f'<div class="metric-card"><h2>{transferred_kg:,.0f} кг</h2><p>Передано на склад ГП</p></div>'.replace(",", " "), unsafe_allow_html=True)
+    c3.markdown(f'<div class="metric-card"><h2>{remaining_kg:,.0f} кг</h2><p>Остаток в производстве</p></div>'.replace(",", " "), unsafe_allow_html=True)
+
+    display = df[["batch_number", "writeoff_date", "material", "supplier",
+                  "quantity_kg", "transferred_kg", "remaining_kg",
+                  "notes", "order_number", "delivery_code", "expiry_date"]].copy()
+    display.columns = ["Партия", "Дата списания", "Товар (иврит)", "Поставщик",
+                       "Отправлено кг", "Передано ГП кг", "Остаток кг",
+                       "Примечание", "№ документа", "Код поставки", "Годен до"]
+    display.insert(2, "Товар", display["Товар (иврит)"].map(lambda h: MATERIALS_MAP.get(h, h)))
+    st.dataframe(display, use_container_width=True, hide_index=True)
 
     st.divider()
-    st.markdown("#### По видам сырья (всего)")
-    summary = df.groupby("Товар")["Кг"].sum().reset_index().sort_values("Кг", ascending=False)
+    st.markdown("#### Остатки в производстве по видам сырья")
+    summary = (
+        df.assign(Товар=df["material"].map(lambda h: MATERIALS_MAP.get(h, h)))
+        .groupby("Товар")[["quantity_kg", "transferred_kg", "remaining_kg"]]
+        .sum()
+        .reset_index()
+        .sort_values("remaining_kg", ascending=False)
+    )
+    summary.columns = ["Товар", "Отправлено кг", "Передано ГП кг", "Остаток кг"]
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
 # ─── PACKAGING ────────────────────────────────────────────────────────────────
@@ -1237,29 +1270,42 @@ def page_journal():
     st.divider()
     st.markdown(f"### Склад №3 — Сырьё в производстве на {sel_date.strftime('%d.%m.%Y')}")
 
-    prod_rows = db_query(f"""
+    prod_rows = db_query("""
         SELECT
             pw.writeoff_date,
             pw.material,
             pw.supplier,
             pw.quantity_kg,
             pw.batch_number,
-            rr.expiry_date
+            rr.expiry_date,
+            COALESCE(SUM(pft.quantity_kg), 0) AS transferred_kg,
+            pw.quantity_kg - COALESCE(SUM(pft.quantity_kg), 0) AS remaining_kg
         FROM production_writeoffs pw
         JOIN raw_receipts rr ON rr.id = pw.receipt_id
+        LEFT JOIN production_finished_transfers pft
+            ON pft.production_writeoff_id = pw.id
+            AND pft.transfer_date <= ?
         WHERE pw.writeoff_date <= ?
+        GROUP BY pw.id, pw.writeoff_date, pw.material, pw.supplier,
+                 pw.quantity_kg, pw.batch_number, rr.expiry_date
+        HAVING pw.quantity_kg - COALESCE(SUM(pft.quantity_kg), 0) > 0.001
         ORDER BY pw.writeoff_date DESC
-    """, (date_str,))
+    """, (date_str, date_str))
 
     if prod_rows:
         df_prod = pd.DataFrame(prod_rows)
         df_prod.insert(1, "Товар", df_prod["material"].map(lambda h: MATERIALS_MAP.get(h, h)))
-        total_prod = df_prod["quantity_kg"].sum()
-        st.markdown(f'<div class="metric-card"><h2>{total_prod:,.0f} кг</h2><p>Всего в производстве</p></div>'.replace(",", " "), unsafe_allow_html=True)
+        total_prod     = df_prod["quantity_kg"].sum()
+        remaining_prod = df_prod["remaining_kg"].sum()
+        c1, c2 = st.columns(2)
+        c1.markdown(f'<div class="metric-card"><h2>{total_prod:,.0f} кг</h2><p>Отправлено в производство</p></div>'.replace(",", " "), unsafe_allow_html=True)
+        c2.markdown(f'<div class="metric-card"><h2>{remaining_prod:,.0f} кг</h2><p>Остаток в производстве</p></div>'.replace(",", " "), unsafe_allow_html=True)
         display_prod = df_prod[["writeoff_date", "Товар", "material", "supplier",
-                                 "quantity_kg", "batch_number", "expiry_date"]].copy()
+                                 "quantity_kg", "transferred_kg", "remaining_kg",
+                                 "batch_number", "expiry_date"]].copy()
         display_prod.columns = ["Дата списания", "Товар", "Товар (иврит)",
-                                 "Поставщик", "Кг", "Партия", "Годен до"]
+                                 "Поставщик", "Отправлено кг", "Передано ГП кг",
+                                 "Остаток кг", "Партия", "Годен до"]
         st.dataframe(display_prod, use_container_width=True, hide_index=True)
     else:
         st.info("На эту дату данных нет")
