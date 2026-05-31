@@ -2,4 +2,3 @@ streamlit==1.57.0
 pandas==2.2.3
 openpyxl==3.1.5
 psycopg2-binary==2.9.12
-streamlit-cookies-controller==0.0.4

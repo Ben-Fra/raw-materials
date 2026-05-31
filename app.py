@@ -3,11 +3,6 @@ import base64, hashlib, hmac, json, os, time, sqlite3
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-try:
-    from streamlit_cookies_controller import CookieController
-    _COOKIES_OK = True
-except ImportError:
-    _COOKIES_OK = False
 
 import pandas as pd
 import streamlit as st
@@ -555,36 +550,34 @@ def inject_css():
     """, unsafe_allow_html=True)
 
 
-_COOKIE_KEY = "wh_auth_token"
+_COOKIE_KEY     = "wh_auth_token"
 _COOKIE_MAX_AGE = AUTH_DAYS * 86400  # секунды
 
 
-def _get_cookie_ctrl():
-    """Возвращает CookieController из session_state (создаёт один раз)."""
-    if not _COOKIES_OK:
+def read_auth_cookie() -> str | None:
+    """Читает cookie мгновенно на сервере — без лишних round-trip."""
+    try:
+        return st.context.cookies.get(_COOKIE_KEY)
+    except Exception:
         return None
-    if "_cookie_ctrl" not in st.session_state:
-        st.session_state["_cookie_ctrl"] = CookieController(key="__wh_auth__")
-    return st.session_state["_cookie_ctrl"]
 
 
 def save_auth_cookie(token: str):
-    ctrl = _get_cookie_ctrl()
-    if ctrl:
-        ctrl.set(_COOKIE_KEY, token, max_age=_COOKIE_MAX_AGE)
-
-
-def read_auth_cookie() -> str | None:
-    ctrl = _get_cookie_ctrl()
-    if ctrl:
-        return ctrl.get(_COOKIE_KEY)
-    return None
+    """Записывает cookie через лёгкий JS (fire-and-forget)."""
+    st.html(
+        f"<script>document.cookie = "
+        f"'{_COOKIE_KEY}={token}; path=/; max-age={_COOKIE_MAX_AGE}; SameSite=Lax';"
+        f"</script>"
+    )
 
 
 def clear_auth_cookie():
-    ctrl = _get_cookie_ctrl()
-    if ctrl:
-        ctrl.remove(_COOKIE_KEY)
+    """Удаляет cookie через JS."""
+    st.html(
+        f"<script>document.cookie = "
+        f"'{_COOKIE_KEY}=; path=/; max-age=0; SameSite=Lax';"
+        f"</script>"
+    )
 
 
 def back_btn(dest="home", label="← Назад"):
