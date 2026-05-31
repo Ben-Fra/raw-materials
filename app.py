@@ -682,7 +682,6 @@ def page_receive():
             with hc1:
                 h_date         = st.date_input("Дата получения", value=date.today())
                 h_order        = st.text_input("Номер документа / накладной")
-                h_delivery     = st.text_input("Код поставки")
             with hc2:
                 h_supplier_sel = st.selectbox("Поставщик (ספק)", [""] + SUPPLIERS + [MANUAL])
                 h_supplier_man = st.text_input("Поставщик — вручную", placeholder="Введите название")
@@ -696,10 +695,9 @@ def page_receive():
                     for e in errors: st.error(e)
                 else:
                     st.session_state.recv_header = {
-                        "recv_date":     h_date.isoformat(),
-                        "order_no":      h_order.strip(),
-                        "delivery_code": h_delivery.strip() or None,
-                        "supplier":      supplier,
+                        "recv_date": h_date.isoformat(),
+                        "order_no":  h_order.strip(),
+                        "supplier":  supplier,
                     }
                     st.rerun()
         return   # не показываем остальное пока шапка не заполнена
@@ -709,10 +707,9 @@ def page_receive():
     # ══════════════════════════════════════════════════════════════════════════
 
     # Карточка шапки
-    delivery_str = f" · Код: {header['delivery_code']}" if header.get("delivery_code") else ""
     st.markdown(
         f"<div style='background:#E3F2FD;border-radius:8px;padding:0.7rem 1rem;margin-bottom:1rem;'>"
-        f"📋 <b>{header['order_no']}</b>{delivery_str} &nbsp;|&nbsp; "
+        f"📋 <b>{header['order_no']}</b> &nbsp;|&nbsp; "
         f"📅 {header['recv_date']} &nbsp;|&nbsp; "
         f"🏢 {header['supplier']}"
         f"</div>",
@@ -730,6 +727,7 @@ def page_receive():
             material_sel    = st.selectbox("Товар (סחורה)", [""] + RAW_MATERIALS + [MANUAL],
                                 format_func=lambda x: material_display(x) if x and x != MANUAL else x)
             material_manual = st.text_input("Товар — вручную", placeholder="Введите название") if material_sel == MANUAL else ""
+            delivery_code   = st.text_input("Код поставки")
             qty_kg          = st.number_input("Количество кг", min_value=0.0, step=0.001, format="%.3f")
         with ic2:
             price_kg  = st.number_input("Цена за кг", min_value=0.0, step=0.01, format="%.3f")
@@ -750,7 +748,7 @@ def page_receive():
                 buf.append({
                     "recv_date":     header["recv_date"],
                     "order_no":      header["order_no"],
-                    "delivery_code": header.get("delivery_code"),
+                    "delivery_code": delivery_code.strip() or None,
                     "supplier":      header["supplier"],
                     "material":      material,
                     "qty_kg":        qty_kg,
@@ -773,6 +771,7 @@ def page_receive():
             "№": i + 1,
             "Товар (рус)": MATERIALS_MAP.get(r["material"], r["material"]),
             "Товар (иврит)": r["material"],
+            "Код поставки": r.get("delivery_code") or "",
             "Кг": r["qty_kg"],
             "Цена/кг": r["price_kg"] or "",
             "Сумма": r["total"] or "",
@@ -804,23 +803,25 @@ def page_receive():
             st.markdown(f"**Редактирование позиции #{idx + 1}**")
             ec1, ec2 = st.columns(2)
             with ec1:
-                e_material = st.text_input("Товар (иврит)",  value=item["material"])
-                e_qty      = st.number_input("Кг",           value=float(item["qty_kg"]), min_value=0.001, step=0.001, format="%.3f")
-                e_price    = st.number_input("Цена/кг",      value=float(item["price_kg"] or 0), min_value=0.0, step=0.01, format="%.3f")
+                e_material  = st.text_input("Товар (иврит)",  value=item["material"])
+                e_delivery  = st.text_input("Код поставки",   value=item.get("delivery_code") or "")
+                e_qty       = st.number_input("Кг",           value=float(item["qty_kg"]), min_value=0.001, step=0.001, format="%.3f")
+                e_price     = st.number_input("Цена/кг",      value=float(item["price_kg"] or 0), min_value=0.0, step=0.01, format="%.3f")
             with ec2:
                 e_prod = st.date_input("Дата произв.", value=date.fromisoformat(item["prod_date"]) if item["prod_date"] else None)
                 e_exp  = st.date_input("Годен до",     value=date.fromisoformat(item["exp_date"])  if item["exp_date"]  else None)
-                st.markdown("*Дата, №, код, поставщик берутся из шапки накладной.*  \nЧтобы изменить — нажмите «Изменить данные накладной» выше.")
+                st.markdown("*Дата, №, поставщик берутся из шапки накладной.*  \nЧтобы изменить — нажмите «Изменить данные накладной» выше.")
 
             if st.form_submit_button("💾 Сохранить изменения", use_container_width=True):
                 buf[idx] = {
-                    **{k: item[k] for k in ("recv_date","order_no","delivery_code","supplier")},
-                    "material":  e_material.strip(),
-                    "qty_kg":    e_qty,
-                    "price_kg":  e_price or None,
-                    "total":     round(e_qty * e_price, 3) if e_price else None,
-                    "prod_date": e_prod.isoformat() if e_prod else None,
-                    "exp_date":  e_exp.isoformat()  if e_exp  else None,
+                    **{k: item[k] for k in ("recv_date","order_no","supplier")},
+                    "delivery_code": e_delivery.strip() or None,
+                    "material":      e_material.strip(),
+                    "qty_kg":        e_qty,
+                    "price_kg":      e_price or None,
+                    "total":         round(e_qty * e_price, 3) if e_price else None,
+                    "prod_date":     e_prod.isoformat() if e_prod else None,
+                    "exp_date":      e_exp.isoformat()  if e_exp  else None,
                 }
                 st.success("Позиция обновлена")
                 st.rerun()
