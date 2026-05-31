@@ -304,18 +304,19 @@ def init_db():
         for s in stmts:
             cur.execute(s)
         conn.commit()
-        # Migration: add batch_number if column doesn't exist yet
-        try:
-            cur.execute("ALTER TABLE production_writeoffs ADD COLUMN batch_number TEXT")
-            conn.commit()
-        except Exception:
-            pass  # column already exists
-        # Migration: add delivery_code if column doesn't exist yet
-        try:
-            cur.execute("ALTER TABLE raw_receipts ADD COLUMN delivery_code TEXT")
-            conn.commit()
-        except Exception:
-            pass  # column already exists
+        migrations = [
+            "ALTER TABLE production_writeoffs ADD COLUMN batch_number TEXT",
+            "ALTER TABLE raw_receipts ADD COLUMN delivery_code TEXT",
+            "ALTER TABLE fg_receipts ADD COLUMN batch_number TEXT",
+            "ALTER TABLE fg_receipts ADD COLUMN production_writeoff_id INTEGER",
+            "ALTER TABLE production_finished_transfers ADD COLUMN is_completion INTEGER DEFAULT 0",
+        ]
+        for m in migrations:
+            try:
+                cur.execute(m)
+                conn.commit()
+            except Exception:
+                pass  # column already exists
     finally:
         conn.close()
 
@@ -340,19 +341,37 @@ def fg_product_label(product):
 
 def get_fg_stock_summary():
     return db_query("""
+        WITH batch_fg AS (
+            SELECT production_writeoff_id,
+                   SUM(net_weight) AS batch_net_total
+            FROM fg_receipts
+            WHERE production_writeoff_id IS NOT NULL
+            GROUP BY production_writeoff_id
+        )
         SELECT
-            product_id AS id,
-            russian_name,
-            hebrew_name,
-            SUM(units_count)  AS units_total,
-            SUM(cartons_count) AS cartons_total,
-            ROUND(CAST(SUM(gross_weight) AS NUMERIC) * 1000) / 1000 AS gross_total,
-            ROUND(CAST(SUM(net_weight)   AS NUMERIC) * 1000) / 1000 AS net_total,
-            MIN(receipt_date) AS first_date,
-            MAX(receipt_date) AS last_date
-        FROM fg_receipts
-        GROUP BY product_id, russian_name, hebrew_name
-        ORDER BY russian_name
+            r.product_id AS id,
+            r.russian_name,
+            r.hebrew_name,
+            COALESCE(r.batch_number, '') AS batch_number,
+            r.production_writeoff_id    AS writeoff_id,
+            pw.quantity_kg              AS raw_weight,
+            bf.batch_net_total,
+            SUM(r.units_count)   AS units_total,
+            SUM(r.cartons_count) AS cartons_total,
+            ROUND(CAST(SUM(r.gross_weight) AS NUMERIC) * 1000) / 1000 AS gross_total,
+            ROUND(CAST(SUM(r.net_weight)   AS NUMERIC) * 1000) / 1000 AS net_total,
+            MIN(r.receipt_date) AS first_date,
+            MAX(r.receipt_date) AS last_date
+        FROM fg_receipts r
+        LEFT JOIN production_writeoffs pw ON pw.id = r.production_writeoff_id
+        LEFT JOIN batch_fg bf ON bf.production_writeoff_id = r.production_writeoff_id
+        GROUP BY r.product_id, r.russian_name, r.hebrew_name,
+                 r.batch_number, r.production_writeoff_id,
+                 pw.quantity_kg, bf.batch_net_total
+        ORDER BY
+            CASE WHEN r.batch_number IS NULL OR r.batch_number = '' THEN 1 ELSE 0 END,
+            r.batch_number,
+            r.russian_name
     """)
 
 def get_fg_receipts(limit=200):
@@ -367,13 +386,14 @@ def get_fg_receipts(limit=200):
     """)
 
 def save_fg_receipt(product, method, gross_weight, units_count, cartons_count,
-                    net_weight, receipt_date, created_by):
+                    net_weight, receipt_date, created_by,
+                    batch_number=None, production_writeoff_id=None):
     if is_pg := DATABASE_URL:
         sql = """INSERT INTO fg_receipts
                     (product_id, hebrew_name, russian_name, unit_weight, tare_weight,
                      calculation_method, units_count, cartons_count, gross_weight,
-                     net_weight, receipt_date, created_by)
-                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id"""
+                     net_weight, receipt_date, created_by, batch_number, production_writeoff_id)
+                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id"""
         import psycopg2
         conn = psycopg2.connect(DATABASE_URL)
         try:
@@ -383,7 +403,7 @@ def save_fg_receipt(product, method, gross_weight, units_count, cartons_count,
                 float(product["unit_weight"]), float(product["tare_weight"]),
                 method, int(units_count), int(cartons_count),
                 float(gross_weight), float(net_weight),
-                str(receipt_date), created_by,
+                str(receipt_date), created_by, batch_number, production_writeoff_id,
             ))
             receipt_id = cur.fetchone()[0]
             conn.commit()
@@ -396,19 +416,43 @@ def save_fg_receipt(product, method, gross_weight, units_count, cartons_count,
             cur.execute("""INSERT INTO fg_receipts
                     (product_id, hebrew_name, russian_name, unit_weight, tare_weight,
                      calculation_method, units_count, cartons_count, gross_weight,
-                     net_weight, receipt_date, created_by)
-                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""", (
+                     net_weight, receipt_date, created_by, batch_number, production_writeoff_id)
+                 VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 product["id"], product["hebrew_name"], product["russian_name"],
                 float(product["unit_weight"]), float(product["tare_weight"]),
                 method, int(units_count), int(cartons_count),
                 float(gross_weight), float(net_weight),
-                str(receipt_date), created_by,
+                str(receipt_date), created_by, batch_number, production_writeoff_id,
             ))
             receipt_id = cur.lastrowid
             conn.commit()
         finally:
             conn.close()
     return receipt_id
+
+
+def complete_batch(writeoff_id: int, created_by: str) -> float:
+    """Полностью списывает остаток партии из производства (без привязки к ГП)."""
+    rows = db_query("""
+        SELECT pw.quantity_kg - COALESCE(SUM(pft.quantity_kg), 0) AS remaining,
+               pw.material, pw.supplier
+        FROM production_writeoffs pw
+        LEFT JOIN production_finished_transfers pft ON pft.production_writeoff_id = pw.id
+        WHERE pw.id = ?
+        GROUP BY pw.id, pw.quantity_kg, pw.material, pw.supplier
+    """, (writeoff_id,))
+    if not rows or rows[0]["remaining"] <= 0.001:
+        return 0.0
+    r = rows[0]
+    db_run(
+        """INSERT INTO production_finished_transfers
+            (production_writeoff_id, material, supplier, quantity_kg,
+             transfer_date, finished_goods_receipt_id, is_completion, created_by)
+           VALUES (?,?,?,?,?,NULL,1,?)""",
+        (writeoff_id, r["material"], r["supplier"],
+         r["remaining"], date.today().isoformat(), created_by),
+    )
+    return float(r["remaining"])
 
 def get_production_stock():
     """Партии сырья, ещё не полностью переданные на склад ГП."""
@@ -1262,7 +1306,16 @@ def page_production():
                        "Отправлено кг", "Передано ГП кг", "Остаток кг",
                        "Примечание", "№ документа", "Код поставки", "Годен до"]
     display.insert(2, "Товар", display["Товар (иврит)"].map(lambda h: MATERIALS_MAP.get(h, h)))
-    st.dataframe(display, use_container_width=True, hide_index=True)
+
+    def _color_prod(row):
+        transferred = row.get("Передано ГП кг", 0) or 0
+        remaining   = row.get("Остаток кг", 0) or 0
+        if transferred > 0 and remaining > 0.001:
+            return ["color: #ff4444; font-weight:600"] * len(row)
+        return [""] * len(row)
+
+    st.dataframe(display.style.apply(_color_prod, axis=1),
+                 use_container_width=True, hide_index=True)
 
     st.divider()
     st.markdown("#### Остатки в производстве по видам сырья")
@@ -1674,6 +1727,38 @@ def page_fg_stock():
     total_net = df_sum["net_total"].sum()
     st.markdown(f'<div class="metric-card-fg"><h2>{total_net:,.3f} кг</h2><p>Общий вес нетто на складе ГП</p></div>'.replace(",", " "), unsafe_allow_html=True)
 
+    # Вычисляем выход % (на уровне партии)
+    def _yield_pct(row):
+        rw = row.get("raw_weight") or 0
+        bn = row.get("batch_net_total") or 0
+        if rw > 0 and bn > 0:
+            return round(bn / rw * 100, 1)
+        return None
+
+    df_sum["yield_pct"] = df_sum.apply(_yield_pct, axis=1)
+
+    st.subheader("Вся готовая продукция на складе")
+
+    # Строим отображаемую таблицу
+    display_sum = df_sum[[
+        "batch_number", "id", "russian_name", "hebrew_name",
+        "units_total", "cartons_total", "gross_total", "net_total",
+        "raw_weight", "yield_pct", "first_date", "last_date",
+    ]].copy()
+    display_sum.columns = [
+        "Партия", "ID", "Продукт", "Иврит",
+        "Штуки", "Картоны", "Брутто кг", "Нетто кг",
+        "Сырьё кг", "Выход %", "Первый приход", "Последний приход",
+    ]
+    display_sum["Партия"] = display_sum["Партия"].replace("", "—")
+    display_sum["Выход %"] = display_sum["Выход %"].apply(
+        lambda v: f"{v:.1f}%" if pd.notna(v) and v else "—"
+    )
+    display_sum["Сырьё кг"] = display_sum["Сырьё кг"].apply(
+        lambda v: f"{v:,.3f}".replace(",", " ") if pd.notna(v) and v else "—"
+    )
+    st.dataframe(display_sum, use_container_width=True, hide_index=True)
+
     # Мультиселект для суммирования
     id_options = df_sum["id"].astype(str).tolist()
     label_by_id = {str(r["id"]): f'{r["id"]} — {r["russian_name"]}' for r in summary}
@@ -1683,25 +1768,10 @@ def page_fg_stock():
         sel = df_sum[df_sum["id"].astype(str).isin(selected_ids)]
         st.markdown("**Сумма по выбранным:**")
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Нетто кг",    f'{sel["net_total"].sum():.3f}')
-        c2.metric("Брутто кг",   f'{sel["gross_total"].sum():.3f}')
-        c3.metric("Штуки",       f'{int(sel["units_total"].sum())}')
-        c4.metric("Картоны",     f'{int(sel["cartons_total"].sum())}')
-        st.dataframe(sel.rename(columns={
-            "id":"ID","russian_name":"Продукт","hebrew_name":"Иврит",
-            "units_total":"Штуки","cartons_total":"Картоны",
-            "gross_total":"Брутто кг","net_total":"Нетто кг",
-            "first_date":"Первый приход","last_date":"Последний приход",
-        }), use_container_width=True, hide_index=True)
-
-    st.subheader("Вся готовая продукция на складе")
-    display_sum = df_sum.rename(columns={
-        "id":"ID","russian_name":"Продукт","hebrew_name":"Иврит",
-        "units_total":"Штуки","cartons_total":"Картоны",
-        "gross_total":"Брутто кг","net_total":"Нетто кг",
-        "first_date":"Первый приход","last_date":"Последний приход",
-    })
-    st.dataframe(display_sum, use_container_width=True, hide_index=True)
+        c1.metric("Нетто кг",  f'{sel["net_total"].sum():.3f}')
+        c2.metric("Брутто кг", f'{sel["gross_total"].sum():.3f}')
+        c3.metric("Штуки",     f'{int(sel["units_total"].sum())}')
+        c4.metric("Картоны",   f'{int(sel["cartons_total"].sum())}')
 
     receipts = get_fg_receipts()
     st.subheader("История внесения")
@@ -1722,12 +1792,12 @@ def page_fg_stock():
     # Excel
     if st.button("📥 Скачать Excel", key="fg_dl"):
         from io import BytesIO
-        buf = BytesIO()
-        with pd.ExcelWriter(buf, engine="openpyxl") as w:
+        xbuf = BytesIO()
+        with pd.ExcelWriter(xbuf, engine="openpyxl") as w:
             display_sum.to_excel(w, index=False, sheet_name="Склад ГП")
             if receipts:
                 pd.DataFrame(receipts).to_excel(w, index=False, sheet_name="История")
-        st.download_button("⬇ Скачать", buf.getvalue(), f"склад_гп_{date.today()}.xlsx")
+        st.download_button("⬇ Скачать", xbuf.getvalue(), f"склад_гп_{date.today()}.xlsx")
 
     # Удаление (Admin)
     if st.session_state.get("current_user") == "Admin" and receipts:
@@ -1866,20 +1936,23 @@ def page_fg_receipt():
         if errors:
             for e in errors: st.error(e)
         else:
+            primary = transfers[0] if transfers else {}
             buf.append({
-                "product":        dict(sel),
-                "product_id":     sel["id"],
-                "russian_name":   sel["russian_name"],
-                "hebrew_name":    sel["hebrew_name"],
-                "unit_weight":    unit_w,
-                "tare_weight":    tare_w,
-                "method":         method,
-                "gross_weight":   float(gross_weight),
-                "units_count":    int(units_count),
-                "cartons_count":  int(cartons_count),
-                "net_weight":     float(net_weight),
-                "receipt_date":   recv_date.isoformat(),
-                "prod_transfers": list(transfers),
+                "product":               dict(sel),
+                "product_id":            sel["id"],
+                "russian_name":          sel["russian_name"],
+                "hebrew_name":           sel["hebrew_name"],
+                "unit_weight":           unit_w,
+                "tare_weight":           tare_w,
+                "method":                method,
+                "gross_weight":          float(gross_weight),
+                "units_count":           int(units_count),
+                "cartons_count":         int(cartons_count),
+                "net_weight":            float(net_weight),
+                "receipt_date":          recv_date.isoformat(),
+                "prod_transfers":        list(transfers),
+                "batch_number":          primary.get("batch_number"),
+                "production_writeoff_id": primary.get("writeoff_id"),
             })
             transfers.clear()
             t_info = f" | {len(buf[-1]['prod_transfers'])} парт. из пр-ва" if buf[-1]["prod_transfers"] else ""
@@ -1909,18 +1982,22 @@ def page_fg_receipt():
                  if p["available_kg"] - already_used.get(p["id"], 0) > 0.001]
 
         if avail:
+            def _ps_label(pid):
+                p = next(x for x in avail if x["id"] == pid)
+                av = p["available_kg"] - already_used.get(p["id"], 0)
+                return f"{p['batch_number']} | {p['supplier']} | доступно: {av:.3f} кг | до: {p.get('expiry_date') or '—'}"
+
+            # Selectbox вне формы — нужен и для добавления, и для завершения
+            sel_ps    = st.selectbox("Партия из производства",
+                                     [p["id"] for p in avail], format_func=_ps_label,
+                                     key="fg_prod_sel")
+            ps_row    = next(x for x in avail if x["id"] == sel_ps)
+            max_avail = float(ps_row["available_kg"]) - already_used.get(sel_ps, 0)
+
             with st.form("fg_prod_transfer_form", clear_on_submit=True):
-                def _ps_label(pid):
-                    p = next(x for x in avail if x["id"] == pid)
-                    av = p["available_kg"] - already_used.get(p["id"], 0)
-                    return f"{p['batch_number']} | {p['supplier']} | доступно: {av:.3f} кг | до: {p.get('expiry_date') or '—'}"
-                sel_ps = st.selectbox("Партия из производства",
-                                      [p["id"] for p in avail], format_func=_ps_label)
-                ps_row   = next(x for x in avail if x["id"] == sel_ps)
-                max_avail = float(ps_row["available_kg"]) - already_used.get(sel_ps, 0)
-                tr_qty   = st.number_input("Количество кг", min_value=0.001,
-                                           max_value=round(max_avail, 3),
-                                           step=0.001, format="%.3f")
+                tr_qty = st.number_input("Количество кг", min_value=0.001,
+                                         max_value=round(max_avail, 3),
+                                         step=0.001, format="%.3f")
                 if st.form_submit_button("➕ Добавить сырьё из производства", use_container_width=True):
                     transfers.append({
                         "writeoff_id":  sel_ps,
@@ -1929,6 +2006,22 @@ def page_fg_receipt():
                         "supplier":     ps_row["supplier"],
                         "qty_kg":       tr_qty,
                     })
+                    st.rerun()
+
+            # ── Кнопка «Завершить партию» ──────────────────────────────────
+            if max_avail > 0.001:
+                st.markdown(
+                    f"<small>Остаток партии **{ps_row['batch_number']}**: "
+                    f"**{max_avail:.3f} кг**</small>",
+                    unsafe_allow_html=True,
+                )
+                if st.button(
+                    f"✅ Завершить партию — списать остаток {max_avail:.3f} кг",
+                    key="complete_batch_btn",
+                    use_container_width=True,
+                ):
+                    written = complete_batch(sel_ps, user)
+                    st.success(f"✅ Партия завершена, списано {written:.3f} кг")
                     st.rerun()
 
     # ── Буфер ──────────────────────────────────────────────────────────────────
@@ -1972,6 +2065,8 @@ def page_fg_receipt():
                     item["product"], item["method"],
                     item["gross_weight"], item["units_count"], item["cartons_count"],
                     item["net_weight"], item["receipt_date"], user,
+                    batch_number=item.get("batch_number"),
+                    production_writeoff_id=item.get("production_writeoff_id"),
                 )
                 for t in item.get("prod_transfers", []):
                     save_production_transfer(
