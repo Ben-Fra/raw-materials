@@ -3,6 +3,12 @@ import base64, hashlib, hmac, json, os, time, sqlite3
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
+try:
+    from streamlit_cookies_controller import CookieController
+    _COOKIES_OK = True
+except ImportError:
+    _COOKIES_OK = False
+
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
@@ -549,42 +555,36 @@ def inject_css():
     """, unsafe_allow_html=True)
 
 
-def auth_script():
-    st.html("""
-    <script>
-    (() => {
-        const KEY = "raw_materials_auth_token";
-        const pw  = window.parent;
-        const url = new URL(pw.location.href);
-        const tok = url.searchParams.get("auth");
-        if (tok) {
-            pw.localStorage.setItem(KEY, tok);
-            url.searchParams.delete("auth");
-            pw.history.replaceState(null, "", url.toString());
-            return;
-        }
-        const saved = pw.localStorage.getItem(KEY);
-        if (saved && !url.searchParams.has("auth")) {
-            url.searchParams.set("auth", saved);
-            pw.location.replace(url.toString());
-        }
-    })();
-    </script>
-    """)
+_COOKIE_KEY = "wh_auth_token"
+_COOKIE_MAX_AGE = AUTH_DAYS * 86400  # секунды
 
 
-def clear_auth_script():
-    st.html("""
-    <script>
-    (() => {
-        const KEY = "raw_materials_auth_token";
-        window.parent.localStorage.removeItem(KEY);
-        const url = new URL(window.parent.location.href);
-        url.searchParams.delete("auth");
-        window.parent.history.replaceState(null, "", url.toString());
-    })();
-    </script>
-    """)
+def _get_cookie_ctrl():
+    """Возвращает CookieController из session_state (создаёт один раз)."""
+    if not _COOKIES_OK:
+        return None
+    if "_cookie_ctrl" not in st.session_state:
+        st.session_state["_cookie_ctrl"] = CookieController(key="__wh_auth__")
+    return st.session_state["_cookie_ctrl"]
+
+
+def save_auth_cookie(token: str):
+    ctrl = _get_cookie_ctrl()
+    if ctrl:
+        ctrl.set(_COOKIE_KEY, token, max_age=_COOKIE_MAX_AGE)
+
+
+def read_auth_cookie() -> str | None:
+    ctrl = _get_cookie_ctrl()
+    if ctrl:
+        return ctrl.get(_COOKIE_KEY)
+    return None
+
+
+def clear_auth_cookie():
+    ctrl = _get_cookie_ctrl()
+    if ctrl:
+        ctrl.remove(_COOKIE_KEY)
 
 
 def back_btn(dest="home", label="← Назад"):
@@ -604,7 +604,7 @@ def page_login():
         if st.button("Войти", type="primary"):
             if username and USERS.get(username) == password:
                 token = make_token(username)
-                st.query_params["auth"] = token
+                save_auth_cookie(token)
                 st.session_state.current_user = username
                 log_access(username, "вход")
                 st.rerun()
@@ -655,7 +655,7 @@ def page_home():
     st.divider()
     if st.button("Выйти", key="logout"):
         log_access(user, "выход")
-        clear_auth_script()
+        clear_auth_cookie()
         del st.session_state.current_user
         st.query_params.clear()
         st.rerun()
@@ -1997,14 +1997,8 @@ def main():
     init_db()
     inject_pwa()
     inject_css()
-    auth_script()
 
-    # Загружаем справочник продуктов ГП один раз за сессию
-    if "_fg_products" not in st.session_state:
-        products = load_products_from_csv()
-        sync_products_to_db(products)
-        st.session_state["_fg_products"] = products
-
+    # Инициализация session state
     if "page" not in st.session_state:
         st.session_state.page = "home"
     if "fg_buffer" not in st.session_state:
@@ -2012,12 +2006,20 @@ def main():
     if "fg_prod_transfers" not in st.session_state:
         st.session_state.fg_prod_transfers = []
 
-    token = st.query_params.get("auth")
-    if isinstance(token, list):
-        token = token[0] if token else None
-    username = check_token(token) if token else None
-    if username:
-        st.session_state.current_user = username
+    # Загружаем справочник продуктов ГП один раз за сессию
+    if "_fg_products" not in st.session_state:
+        products = load_products_from_csv()
+        sync_products_to_db(products)
+        st.session_state["_fg_products"] = products
+
+    # ── Авторизация через cookie ──────────────────────────────────────────────
+    # CookieController рендерится один раз и читает cookie из браузера
+    if "current_user" not in st.session_state:
+        saved_token = read_auth_cookie()
+        if saved_token:
+            username = check_token(saved_token)
+            if username:
+                st.session_state.current_user = username
 
     if "current_user" not in st.session_state:
         page_login()
