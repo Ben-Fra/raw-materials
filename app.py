@@ -666,51 +666,99 @@ def page_receive():
     st.markdown('<div class="page-title">📥 Приём сырья — Склад №2</div>', unsafe_allow_html=True)
     back_btn()
 
-    user  = st.session_state.current_user
+    user   = st.session_state.current_user
     MANUAL = "✏️ Ввести вручную..."
 
     if "recv_buffer" not in st.session_state:
         st.session_state.recv_buffer = []
-    buf = st.session_state.recv_buffer
+    if "recv_header" not in st.session_state:
+        st.session_state.recv_header = None
 
-    # ── Форма добавления в буфер ──
-    st.markdown("#### Добавить позицию в буфер")
-    with st.form("recv_form", clear_on_submit=True):
-        col1, col2 = st.columns(2)
-        with col1:
-            recv_date       = st.date_input("Дата получения", value=date.today())
-            order_no        = st.text_input("Номер документа")
-            delivery_code   = st.text_input("Код поставки")
-            supplier_sel    = st.selectbox("Поставщик (ספק)", [""] + SUPPLIERS + [MANUAL])
-            supplier_manual = st.text_input("Поставщик — вручную", placeholder="Введите название") if supplier_sel == MANUAL else ""
+    buf    = st.session_state.recv_buffer
+    header = st.session_state.recv_header
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ШАГ 1 — Шапка накладной (вводится один раз)
+    # ══════════════════════════════════════════════════════════════════════════
+    if header is None:
+        st.markdown("#### 📋 Шаг 1 — Данные накладной")
+        st.info("Введите общие данные для всей накладной. Позиции будут добавляться на следующем шаге.")
+
+        with st.form("recv_header_form"):
+            hc1, hc2 = st.columns(2)
+            with hc1:
+                h_date         = st.date_input("Дата получения", value=date.today())
+                h_order        = st.text_input("Номер документа / накладной")
+                h_delivery     = st.text_input("Код поставки")
+            with hc2:
+                h_supplier_sel = st.selectbox("Поставщик (ספק)", [""] + SUPPLIERS + [MANUAL])
+                h_supplier_man = st.text_input("Поставщик — вручную", placeholder="Введите название")
+
+            if st.form_submit_button("→ Перейти к вводу позиций", type="primary", use_container_width=True):
+                supplier = h_supplier_man.strip() if h_supplier_sel == MANUAL else h_supplier_sel
+                errors = []
+                if not h_order.strip(): errors.append("Укажите номер документа / накладной")
+                if not supplier:        errors.append("Выберите или введите поставщика")
+                if errors:
+                    for e in errors: st.error(e)
+                else:
+                    st.session_state.recv_header = {
+                        "recv_date":     h_date.isoformat(),
+                        "order_no":      h_order.strip(),
+                        "delivery_code": h_delivery.strip() or None,
+                        "supplier":      supplier,
+                    }
+                    st.rerun()
+        return   # не показываем остальное пока шапка не заполнена
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # ШАГ 2 — Шапка зафиксирована, вводим позиции
+    # ══════════════════════════════════════════════════════════════════════════
+
+    # Карточка шапки
+    delivery_str = f" · Код: {header['delivery_code']}" if header.get("delivery_code") else ""
+    st.markdown(
+        f"<div style='background:#E3F2FD;border-radius:8px;padding:0.7rem 1rem;margin-bottom:1rem;'>"
+        f"📋 <b>{header['order_no']}</b>{delivery_str} &nbsp;|&nbsp; "
+        f"📅 {header['recv_date']} &nbsp;|&nbsp; "
+        f"🏢 {header['supplier']}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+    if st.button("✏️ Изменить данные накладной", key="edit_header_btn"):
+        st.session_state.recv_header = None
+        st.rerun()
+
+    # ── Форма добавления позиции ──────────────────────────────────────────────
+    st.markdown("#### Добавить позицию")
+    with st.form("recv_item_form", clear_on_submit=True):
+        ic1, ic2 = st.columns(2)
+        with ic1:
             material_sel    = st.selectbox("Товар (סחורה)", [""] + RAW_MATERIALS + [MANUAL],
                                 format_func=lambda x: material_display(x) if x and x != MANUAL else x)
             material_manual = st.text_input("Товар — вручную", placeholder="Введите название") if material_sel == MANUAL else ""
-        with col2:
-            qty_kg    = st.number_input("Количество кг", min_value=0.0, step=0.001, format="%.3f")
+            qty_kg          = st.number_input("Количество кг", min_value=0.0, step=0.001, format="%.3f")
+        with ic2:
             price_kg  = st.number_input("Цена за кг", min_value=0.0, step=0.01, format="%.3f")
             prod_date = st.date_input("Дата производства (תוצרת)", value=None)
             exp_date  = st.date_input("Годен до (תוקף)", value=None)
 
-        supplier = supplier_manual.strip() if supplier_sel == MANUAL else supplier_sel
         material = material_manual.strip() if material_sel == MANUAL else material_sel
         total    = round(qty_kg * price_kg, 3) if qty_kg and price_kg else 0.0
-        st.markdown(f"**Общая сумма: {total:,.3f}**")
+        st.markdown(f"**Сумма позиции: {total:,.3f}**")
 
-        if st.form_submit_button("➕ Добавить в буфер", type="primary", use_container_width=True):
+        if st.form_submit_button("➕ Добавить позицию", type="primary", use_container_width=True):
             errors = []
-            if not order_no.strip(): errors.append("Укажите номер товарной накладной")
-            if not supplier:         errors.append("Выберите или введите поставщика")
-            if not material:         errors.append("Выберите или введите название товара")
-            if qty_kg <= 0:          errors.append("Количество должно быть больше 0")
+            if not material: errors.append("Выберите или введите название товара")
+            if qty_kg <= 0:  errors.append("Количество должно быть больше 0")
             if errors:
                 for e in errors: st.error(e)
             else:
                 buf.append({
-                    "recv_date":     recv_date.isoformat(),
-                    "order_no":      order_no.strip(),
-                    "delivery_code": delivery_code.strip() or None,
-                    "supplier":      supplier,
+                    "recv_date":     header["recv_date"],
+                    "order_no":      header["order_no"],
+                    "delivery_code": header.get("delivery_code"),
+                    "supplier":      header["supplier"],
                     "material":      material,
                     "qty_kg":        qty_kg,
                     "price_kg":      price_kg or None,
@@ -718,30 +766,43 @@ def page_receive():
                     "prod_date":     prod_date.isoformat() if prod_date else None,
                     "exp_date":      exp_date.isoformat()  if exp_date  else None,
                 })
-                st.success(f"Добавлено в буфер: {material} — {qty_kg:,.3f} кг")
+                mat_display = MATERIALS_MAP.get(material, material)
+                st.success(f"Добавлено: {mat_display} — {qty_kg:,.3f} кг")
 
-    # ── Буфер ──
+    # ── Буфер ─────────────────────────────────────────────────────────────────
     st.divider()
-    st.markdown(f"#### Буфер — {len(buf)} поз. (проверьте перед сохранением на склад)")
+    st.markdown(f"#### Позиции накладной — {len(buf)} шт. (проверьте перед сохранением)")
 
     if not buf:
-        st.info("Буфер пуст. Добавьте позиции выше, проверьте и сохраните на склад.")
+        st.info("Позиций пока нет. Добавьте позиции выше, затем сохраните на склад.")
     else:
         df_buf = pd.DataFrame([{
             "№": i + 1,
-            "Дата": r["recv_date"], "№ документа": r["order_no"],
-            "Код поставки": r.get("delivery_code") or "",
-            "Поставщик": r["supplier"], "Товар": r["material"],
-            "Кг": r["qty_kg"], "Цена/кг": r["price_kg"] or "",
+            "Товар (рус)": MATERIALS_MAP.get(r["material"], r["material"]),
+            "Товар (иврит)": r["material"],
+            "Кг": r["qty_kg"],
+            "Цена/кг": r["price_kg"] or "",
             "Сумма": r["total"] or "",
-            "Произв.": r["prod_date"] or "", "Годен до": r["exp_date"] or "",
+            "Дата произв.": r["prod_date"] or "",
+            "Годен до": r["exp_date"] or "",
         } for i, r in enumerate(buf)])
         st.dataframe(df_buf, use_container_width=True, hide_index=True)
 
+        # Итого по позициям
+        total_kg  = sum(r["qty_kg"] for r in buf)
+        total_sum = sum(r["total"] or 0 for r in buf)
+        tc1, tc2 = st.columns(2)
+        tc1.metric("Итого кг",  f"{total_kg:,.3f}".replace(",", " "))
+        tc2.metric("Итого сумма", f"{total_sum:,.2f}".replace(",", " "))
+
+        # ── Редактирование выбранной позиции ──
         idx = st.selectbox(
             "Выберите позицию для редактирования / удаления",
             range(len(buf)),
-            format_func=lambda i: f"#{i+1}  {buf[i]['material']} | {buf[i]['supplier']} | {buf[i]['qty_kg']:,.3f} кг",
+            format_func=lambda i: (
+                f"#{i+1}  {MATERIALS_MAP.get(buf[i]['material'], buf[i]['material'])} "
+                f"| {buf[i]['qty_kg']:,.3f} кг"
+            ),
             key="recv_edit_idx",
         )
         item = buf[idx]
@@ -750,29 +811,23 @@ def page_receive():
             st.markdown(f"**Редактирование позиции #{idx + 1}**")
             ec1, ec2 = st.columns(2)
             with ec1:
-                e_date     = st.date_input("Дата",          value=date.fromisoformat(item["recv_date"]))
-                e_order    = st.text_input("Номер документа", value=item["order_no"])
-                e_delivery = st.text_input("Код поставки",    value=item.get("delivery_code") or "")
-                e_supplier = st.text_input("Поставщик",      value=item["supplier"])
-                e_material = st.text_input("Товар",          value=item["material"])
+                e_material = st.text_input("Товар (иврит)",  value=item["material"])
+                e_qty      = st.number_input("Кг",           value=float(item["qty_kg"]), min_value=0.001, step=0.001, format="%.3f")
+                e_price    = st.number_input("Цена/кг",      value=float(item["price_kg"] or 0), min_value=0.0, step=0.01, format="%.3f")
             with ec2:
-                e_qty   = st.number_input("Кг",       value=float(item["qty_kg"]),         min_value=0.001, step=0.001, format="%.3f")
-                e_price = st.number_input("Цена/кг",  value=float(item["price_kg"] or 0),  min_value=0.0,   step=0.01,  format="%.3f")
-                e_prod  = st.date_input("Дата произв.", value=date.fromisoformat(item["prod_date"]) if item["prod_date"] else None)
-                e_exp   = st.date_input("Годен до",    value=date.fromisoformat(item["exp_date"])  if item["exp_date"]  else None)
+                e_prod = st.date_input("Дата произв.", value=date.fromisoformat(item["prod_date"]) if item["prod_date"] else None)
+                e_exp  = st.date_input("Годен до",     value=date.fromisoformat(item["exp_date"])  if item["exp_date"]  else None)
+                st.markdown("*Дата, №, код, поставщик берутся из шапки накладной.*  \nЧтобы изменить — нажмите «Изменить данные накладной» выше.")
 
             if st.form_submit_button("💾 Сохранить изменения", use_container_width=True):
                 buf[idx] = {
-                    "recv_date":     e_date.isoformat(),
-                    "order_no":      e_order.strip(),
-                    "delivery_code": e_delivery.strip() or None,
-                    "supplier":      e_supplier.strip(),
-                    "material":      e_material.strip(),
-                    "qty_kg":        e_qty,
-                    "price_kg":      e_price or None,
-                    "total":         round(e_qty * e_price, 3) if e_price else None,
-                    "prod_date":     e_prod.isoformat() if e_prod else None,
-                    "exp_date":      e_exp.isoformat()  if e_exp  else None,
+                    **{k: item[k] for k in ("recv_date","order_no","delivery_code","supplier")},
+                    "material":  e_material.strip(),
+                    "qty_kg":    e_qty,
+                    "price_kg":  e_price or None,
+                    "total":     round(e_qty * e_price, 3) if e_price else None,
+                    "prod_date": e_prod.isoformat() if e_prod else None,
+                    "exp_date":  e_exp.isoformat()  if e_exp  else None,
                 }
                 st.success("Позиция обновлена")
                 st.rerun()
@@ -783,8 +838,9 @@ def page_receive():
                 buf.pop(idx)
                 st.rerun()
         with c2:
-            if st.button("🗑 Очистить весь буфер", use_container_width=True):
+            if st.button("🗑 Очистить буфер и начать заново", use_container_width=True):
                 buf.clear()
+                st.session_state.recv_header = None
                 st.rerun()
         with c3:
             if st.button(f"✅ Сохранить на склад ({len(buf)} поз.)", type="primary", use_container_width=True):
@@ -801,6 +857,7 @@ def page_receive():
                     )
                 n = len(buf)
                 buf.clear()
+                st.session_state.recv_header = None
                 st.success(f"✅ Сохранено на склад: {n} позиций")
                 st.rerun()
 
