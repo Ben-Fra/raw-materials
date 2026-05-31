@@ -2,6 +2,7 @@ services:
   - type: web
     name: raw-materials
     env: python
+    autoDeploy: true
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.address 0.0.0.0 --server.port $PORT
     envVars:
